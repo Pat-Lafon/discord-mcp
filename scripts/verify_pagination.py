@@ -28,12 +28,12 @@ TARGETS = {
 async def main() -> int:
     state = create_client_state(email="", password="", headless=True)
     try:
-        # 1100h covers ~46 days, well past the oldest target (2026-03-25, ~40d).
+        # Max-out: 8760h (1 year) and 1000 msg cap to probe true depth.
         state, msgs = await read_recent_messages(
             state,
             server_id=SERVER_ID,
             channel_id=SHOWCASE_ID,
-            hours_back=1100,
+            hours_back=8760,
             max_messages=1000,
         )
     finally:

@@ -93,8 +93,13 @@ async def read_messages(
     """
     if not (1 <= hours_back <= 8760):
         raise ValueError("hours_back must be between 1 and 8760 (1 year)")
-    if not (1 <= max_messages <= 1000):
-        raise ValueError("max_messages must be between 1 and 1000")
+    # Cap is a soft guard, not a structural limit — the scroll loop in
+    # client.get_channel_messages has no internal cap and the underlying
+    # Discord client renders virtualized lists into the tens of thousands
+    # without trouble. 5000 covers ~3 months of a busy (~50 msgs/day) channel
+    # in one call; raise further if you need full multi-year reads.
+    if not (1 <= max_messages <= 5000):
+        raise ValueError("max_messages must be between 1 and 5000")
 
     ctx = mcp.get_context()
     discord_ctx = tp.cast(DiscordContext, ctx.request_context.lifespan_context)
