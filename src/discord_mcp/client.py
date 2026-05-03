@@ -428,6 +428,53 @@ async def _extract_message_data(
         return None
 
 
+async def _scroll_chat_up(page: Page) -> None:
+    """Scroll the virtualized chat container upward to load older messages.
+
+    Discord's lazy-load uses an IntersectionObserver near the top of the chat;
+    setting `scrollTop` directly doesn't always fire it. Instead, ask the
+    topmost rendered message to scrollIntoView() — that moves the viewport AND
+    triggers the observer the same way a real user scroll would.
+    """
+    await page.evaluate("""
+        () => {
+            const els = document.querySelectorAll('[data-list-id="chat-messages"] [id^="chat-messages-"]');
+            if (!els.length) return;
+            els[0].scrollIntoView({ block: 'end', behavior: 'auto' });
+        }
+    """)
+    # Belt-and-suspenders: also send PageUp in case scrollIntoView lands the
+    # element below the observer trigger zone.
+    try:
+        await page.keyboard.press("PageUp")
+    except Exception:
+        pass
+
+
+async def _wait_for_top_change(
+    page: Page, prev_top: str | None, timeout_ms: int = 5000
+) -> bool:
+    """Block until the topmost rendered message ID changes, or timeout.
+
+    Returns True if the top changed (older content loaded), False on timeout
+    (likely at the channel's first message or load is stuck).
+    """
+    try:
+        await page.wait_for_function(
+            """(prev) => {
+                const els = document.querySelectorAll('[data-list-id="chat-messages"] [id^="chat-messages-"]');
+                if (!els.length) return false;
+                const top = els[0].id.replace('chat-messages-', '');
+                return top !== prev;
+            }""",
+            arg=prev_top or "",
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def get_channel_messages(
     state: ClientState,
     server_id: str,
@@ -435,7 +482,17 @@ async def get_channel_messages(
     limit: int = 100,
     before: str | None = None,
     after: str | None = None,
+    until_timestamp: datetime | None = None,
 ) -> tuple[ClientState, list[DiscordMessage]]:
+    """Fetch messages from a channel.
+
+    Scrolls back through Discord's virtualized chat until any of:
+      - `limit` messages collected
+      - oldest collected message is older than `until_timestamp`
+      - oldest visible DOM message is older than `before` cursor
+      - top of channel reached (oldest visible ID stops changing for 3 iterations)
+      - hard safety cap of 200 scroll iterations
+    """
     state = await _login(state)
     if not state.page:
         raise RuntimeError("Browser page not initialized")
@@ -454,17 +511,15 @@ async def get_channel_messages(
     """)
     await state.page.wait_for_timeout(2000)
 
-    messages = []
-    seen_ids = set()
+    messages: list[DiscordMessage] = []
+    seen_ids: set[str] = set()
+    plateau_count = 0
+    MAX_ITERATIONS = 300
 
-    for attempt in range(10):
+    for iteration in range(MAX_ITERATIONS):
         elements = await state.page.query_selector_all(
             '[data-list-id="chat-messages"] [id^="chat-messages-"]'
         )
-        if not elements:
-            await state.page.keyboard.press("PageUp")
-            await state.page.wait_for_timeout(1000)
-            continue
 
         for element in reversed(elements):
             if len(messages) >= limit:
@@ -473,20 +528,56 @@ async def get_channel_messages(
                 message = await _extract_message_data(
                     element, channel_id, len(seen_ids)
                 )
-                if message and message.id not in seen_ids:
-                    if before and message.id >= before:
-                        continue
-                    if after and message.id <= after:
-                        continue
-                    seen_ids.add(message.id)
-                    messages.append(message)
+                if not message or message.id in seen_ids:
+                    continue
+                if before and message.id >= before:
+                    continue
+                if after and message.id <= after:
+                    continue
+                seen_ids.add(message.id)
+                messages.append(message)
             except Exception:
                 continue
 
-        if len(messages) >= limit or not elements:
+        if len(messages) >= limit:
             break
-        await state.page.keyboard.press("PageUp")
-        await state.page.wait_for_timeout(1000)
+
+        # Snowflake string-compare on oldest currently-visible DOM node.
+        # (Works because all modern Discord snowflakes are 19 digits.)
+        oldest_visible_id = await state.page.evaluate("""
+            () => {
+                const els = document.querySelectorAll('[data-list-id="chat-messages"] [id^="chat-messages-"]');
+                if (!els.length) return null;
+                return els[0].id.replace('chat-messages-', '');
+            }
+        """)
+
+        # Time-window early stop.
+        if until_timestamp and messages:
+            if min(m.timestamp for m in messages) < until_timestamp:
+                break
+
+        # `before` cursor early stop: scrolled past the cursor's chronological position.
+        if before and oldest_visible_id and oldest_visible_id < before:
+            break
+
+        await _scroll_chat_up(state.page)
+
+        # Wait for the topmost message to actually change. If it doesn't within
+        # the timeout, we've likely hit the channel's first message (or load
+        # is genuinely stuck) — confirm with one retry, then stop.
+        changed = await _wait_for_top_change(
+            state.page, oldest_visible_id, timeout_ms=5000
+        )
+        if not changed:
+            plateau_count += 1
+            if plateau_count >= 2:
+                logger.debug(
+                    f"Scroll plateau at top after {iteration + 1} iterations, stopping"
+                )
+                break
+        else:
+            plateau_count = 0
 
     return state, sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit]
 

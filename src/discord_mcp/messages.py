@@ -9,19 +9,23 @@ async def read_recent_messages(
     channel_id: str,
     hours_back: int = 24,
     max_messages: int = 1000,
+    before: str | None = None,
 ) -> tuple[ClientState, list[DiscordMessage]]:
     logger.debug(
-        f"read_recent_messages called for server {server_id}, channel {channel_id}, {hours_back}h back, max {max_messages}"
+        f"read_recent_messages called for server {server_id}, channel {channel_id}, {hours_back}h back, max {max_messages}, before={before}"
     )
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     logger.debug(f"Cutoff time set to: {cutoff_time}")
 
-    # Get messages in chronological order (newest first)
+    # Get messages in chronological order (newest first). Pass cutoff so the
+    # scroll-up loop can stop as soon as it goes past the time window.
     state, all_messages = await get_channel_messages(
         state,
         server_id=server_id,
         channel_id=channel_id,
         limit=max_messages,
+        before=before,
+        until_timestamp=cutoff_time,
     )
     logger.debug(f"Retrieved {len(all_messages)} total messages")
 

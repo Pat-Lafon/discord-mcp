@@ -79,9 +79,18 @@ async def get_channels(server_id: str) -> list[dict[str, str]]:
 
 @mcp.tool()
 async def read_messages(
-    server_id: str, channel_id: str, max_messages: int, hours_back: int = 24
+    server_id: str,
+    channel_id: str,
+    max_messages: int,
+    hours_back: int = 24,
+    before: str | None = None,
 ) -> list[dict[str, tp.Any]]:
-    """Read recent messages from a specific channel"""
+    """Read recent messages from a specific channel.
+
+    Pass `before` (a Discord message ID / snowflake) to paginate further back —
+    the read will only return messages chronologically older than that ID.
+    Combine with `hours_back` and `max_messages` to bound the scroll-back depth.
+    """
     if not (1 <= hours_back <= 8760):
         raise ValueError("hours_back must be between 1 and 8760 (1 year)")
     if not (1 <= max_messages <= 1000):
@@ -92,7 +101,7 @@ async def read_messages(
 
     async def operation(state):
         return await read_recent_messages(
-            state, server_id, channel_id, hours_back, max_messages
+            state, server_id, channel_id, hours_back, max_messages, before
         )
 
     messages = await _execute_with_fresh_client(discord_ctx, operation)
