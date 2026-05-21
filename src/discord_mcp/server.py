@@ -2,11 +2,16 @@ import asyncio
 import typing as tp
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mcp.server.fastmcp import FastMCP
+from playwright.async_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
 from .logger import logger
 from .client import (
+    ClientState,
     create_client_state,
     get_guilds,
     get_guild_channels,
@@ -21,6 +26,7 @@ from .messages import read_recent_messages
 class DiscordContext:
     config: tp.Any
     client_lock: asyncio.Lock
+    client_state: ClientState | None = None
 
 
 @asynccontextmanager
@@ -28,27 +34,57 @@ async def discord_lifespan(server: FastMCP) -> AsyncIterator[DiscordContext]:
     config = load_config()
     client_lock = asyncio.Lock()
     logger.debug("Discord MCP server starting up")
+    ctx = DiscordContext(config=config, client_lock=client_lock)
     try:
-        yield DiscordContext(config=config, client_lock=client_lock)
+        yield ctx
     finally:
         logger.debug("Discord MCP server shutting down")
+        if ctx.client_state is not None:
+            await close_client(ctx.client_state)
 
 
-async def _execute_with_fresh_client[T](
+async def _execute_with_persistent_client[T](
     discord_ctx: DiscordContext,
-    operation: Callable[[tp.Any], tp.Awaitable[tuple[tp.Any, T]]],
+    operation: Callable[[ClientState], tp.Awaitable[tuple[ClientState, T]]],
 ) -> T:
-    """Execute Discord operation with fresh client state"""
+    """Execute Discord operation with a persistent client, retrying once on Playwright errors."""
+    cfg = discord_ctx.config
     async with discord_ctx.client_lock:
-        client_state = create_client_state(
-            discord_ctx.config.email, discord_ctx.config.password, True
-        )
-        try:
-            _, result = await operation(client_state)
-            return result
-        finally:
-            logger.debug("Cleaning up browser resources")
-            await close_client(client_state)
+        if discord_ctx.client_state is not None and (
+            discord_ctx.client_state.page is None
+            or discord_ctx.client_state.page.is_closed()
+        ):
+            await close_client(discord_ctx.client_state)
+            discord_ctx.client_state = None
+        if discord_ctx.client_state is None:
+            discord_ctx.client_state = create_client_state(
+                cfg.email, cfg.password, cfg.headless
+            )
+        else:
+            # Force _login to re-run _check_logged_in; it early-returns on logged_in=True.
+            discord_ctx.client_state = replace(
+                discord_ctx.client_state, logged_in=False
+            )
+
+        for attempt in (1, 2):
+            try:
+                new_state, result = await operation(discord_ctx.client_state)
+                discord_ctx.client_state = new_state
+                return result
+            except Exception as e:
+                await close_client(discord_ctx.client_state)
+                discord_ctx.client_state = None
+                if attempt == 2 or not isinstance(
+                    e, (PlaywrightError, PlaywrightTimeoutError)
+                ):
+                    raise
+                logger.warning(
+                    "operation failed on attempt %s, retrying: %s", attempt, e
+                )
+                discord_ctx.client_state = create_client_state(
+                    cfg.email, cfg.password, cfg.headless
+                )
+        raise RuntimeError("unreachable")
 
 
 mcp = FastMCP("discord-mcp", lifespan=discord_lifespan)
@@ -60,7 +96,7 @@ async def get_servers() -> list[dict[str, str]]:
     ctx = mcp.get_context()
     discord_ctx = tp.cast(DiscordContext, ctx.request_context.lifespan_context)
 
-    guilds = await _execute_with_fresh_client(discord_ctx, get_guilds)
+    guilds = await _execute_with_persistent_client(discord_ctx, get_guilds)
     return [{"id": g.id, "name": g.name} for g in guilds]
 
 
@@ -73,7 +109,7 @@ async def get_channels(server_id: str) -> list[dict[str, str]]:
     async def operation(state):
         return await get_guild_channels(state, server_id)
 
-    channels = await _execute_with_fresh_client(discord_ctx, operation)
+    channels = await _execute_with_persistent_client(discord_ctx, operation)
     return [{"id": c.id, "name": c.name, "type": str(c.type)} for c in channels]
 
 
@@ -95,7 +131,7 @@ async def read_messages(
             state, server_id, channel_id, hours_back, max_messages
         )
 
-    messages = await _execute_with_fresh_client(discord_ctx, operation)
+    messages = await _execute_with_persistent_client(discord_ctx, operation)
     return [
         {
             "id": m.id,
@@ -178,7 +214,7 @@ async def send_message(
                 state, server_id, channel_id, chunk_content
             )
 
-        message_id = await _execute_with_fresh_client(discord_ctx, operation)
+        message_id = await _execute_with_persistent_client(discord_ctx, operation)
         message_ids.append(message_id)
 
         # Small delay between messages to avoid rate limiting
