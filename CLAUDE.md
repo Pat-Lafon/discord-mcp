@@ -23,15 +23,8 @@ This implementation uses **Playwright web scraping** instead of Discord's API be
 - Web scraping enables reading from any Discord server you can access as a user
 - No need for bot creation or server permissions
 
-## Package Management
-- Use `uv` package manager for all operations
-- Use `uv run` prefix for all Python commands
-- Use `uv add` for adding dependencies
-
 ## Code Quality
 - Always run `uv run pyright` for Python type checking
-- Always run `uvx ruff format .` for formatting
-- Always run `uvx ruff check --fix --unsafe-fixes .` for linting
 
 ## Current Architecture
 - **`main.py`** - Entry point that starts the MCP server
@@ -82,9 +75,8 @@ The implementation prioritizes **reliability over speed** through:
 ## Development Workflow
 1. Make changes following functional programming patterns
 2. Run `uv run pyright` for type checking
-3. Run `uvx ruff format .` and `uvx ruff check --fix --unsafe-fixes .` for code quality
-4. Run `uv run pytest -v tests/` for integration testing
-5. Verify all 4 MCP tools work correctly
+3. Run `uv run pytest -v tests/` for integration testing
+4. Verify all 4 MCP tools work correctly
 
 ## Configuration
 Set environment variables:
