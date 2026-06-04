@@ -91,5 +91,3 @@ Messages are returned in **chronological order (newest first)**:
 - `max_messages: 1` returns the most recent message
 - `max_messages: 20` returns the 20 most recent messages
 - More messages means going further back in time chronologically
-
-This ordering was fixed from previous counterintuitive behavior and now works correctly and consistently.
