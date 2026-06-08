@@ -1,28 +1,5 @@
 # Discord MCP Server (Python)
 
-## Task
-Build a Discord MCP (Model Context Protocol) server that can:
-- Read messages across multiple Discord servers and channels
-- Send messages to Discord channels  
-- List Discord servers and channels
-- Provide efficient message reading with proper chronological ordering
-- Handle authentication with Discord credentials using web scraping
-
-## Use Cases
-Enable an LLM to:
-1. Monitor Discord servers and communities of interest
-2. Read and summarize recent messages from channels
-3. Send messages to Discord channels
-4. Discover available servers and channels
-
-This enables automated community monitoring, content aggregation, and interaction across Discord servers for purposes like community engagement, trend monitoring, and content curation.
-
-## Implementation Approach
-This implementation uses **Playwright web scraping** instead of Discord's API because:
-- Discord's API only allows reading from servers where you have bot permissions
-- Web scraping enables reading from any Discord server you can access as a user
-- No need for bot creation or server permissions
-
 ## Code Quality
 - Always run `uv run pyright` for Python type checking
 
@@ -43,7 +20,7 @@ This implementation uses **Playwright web scraping** instead of Discord's API be
 
 ## Dependencies
 - **mcp** - Official MCP library via FastMCP
-- **playwright** - Browser automation for Discord web scraping  
+- **playwright** - Browser automation for Discord web scraping
 - **python-dotenv** - Environment variable management
 - **pytest** - Testing framework
 
@@ -57,20 +34,12 @@ The implementation prioritizes **reliability over speed** through:
 
 ### Message Extraction
 - **Chronological ordering**: Messages returned newest-first
-- **Simplified extraction**: Streamlined from ~130 lines to ~54 lines
 - **Robust scrolling**: JavaScript-based scroll to bottom for newest messages
 - **Proper filtering**: Time-based and count-based message limiting
 
 ### Test Execution
 - Sequential test execution (`-n 0` in pytest.ini) to avoid resource conflicts
 - Comprehensive integration tests covering all 4 MCP tools
-- 100% test reliability across multiple runs
-
-## Performance Characteristics
-- **Cookie persistence** eliminates re-login overhead  
-- **JavaScript extraction** faster than clicking through UI elements
-- **Fresh browser state** adds ~2-3 seconds per tool call but ensures reliability
-- **Simplified message logic** improved performance while maintaining functionality
 
 ## Development Workflow
 1. Make changes following functional programming patterns
