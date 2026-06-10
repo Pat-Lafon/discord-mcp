@@ -16,7 +16,7 @@ async def read_recent_messages(
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     logger.debug(f"Cutoff time set to: {cutoff_time}")
 
-    # Get messages in chronological order (newest first)
+    # Get messages in reverse-chronological order (newest first)
     state, all_messages = await get_channel_messages(
         state,
         server_id=server_id,
@@ -32,6 +32,6 @@ async def read_recent_messages(
     )
 
     logger.debug(
-        f"read_recent_messages completed, returning {len(recent_messages)} messages in chronological order (newest first)"
+        f"read_recent_messages completed, returning {len(recent_messages)} messages in reverse-chronological order (newest first)"
     )
     return state, recent_messages

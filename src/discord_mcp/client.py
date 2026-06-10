@@ -2,7 +2,13 @@ import asyncio
 import pathlib as pl
 from datetime import datetime, timezone
 import dataclasses as dc
-from playwright.async_api import async_playwright, Browser, Page, Playwright
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 from .logger import logger
 
 
@@ -444,7 +450,18 @@ async def get_channel_messages(
         f"https://discord.com/channels/{server_id}/{channel_id}",
         wait_until="domcontentloaded",
     )
-    await state.page.wait_for_selector('[data-list-id="chat-messages"]', timeout=15000)
+    # Headless renders are flaky: the chat list usually appears in ~2s but
+    # sometimes stalls indefinitely. Wait generously, then reload once before
+    # giving up.
+    try:
+        await state.page.wait_for_selector(
+            '[data-list-id="chat-messages"]', timeout=60000
+        )
+    except PlaywrightTimeoutError:
+        await state.page.reload(wait_until="domcontentloaded")
+        await state.page.wait_for_selector(
+            '[data-list-id="chat-messages"]', timeout=60000
+        )
 
     # Scroll to bottom for newest messages
     await state.page.evaluate("""

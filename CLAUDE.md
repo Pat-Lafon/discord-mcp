@@ -15,7 +15,7 @@
 ## MCP Tools Implemented
 - **`get_servers`** - List all Discord servers you have access to
 - **`get_channels(server_id)`** - List all channels in a specific Discord server
-- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in chronological order (newest first)
+- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in reverse-chronological order (newest first)
 - **`send_message(server_id, channel_id, content)`** - Send messages to specific Discord channels (automatically splits long messages)
 
 ## Dependencies
@@ -56,7 +56,7 @@ DISCORD_HEADLESS=true  # For production
 ```
 
 ## Message Ordering Behavior
-Messages are returned in **chronological order (newest first)**:
+Messages are returned in **reverse-chronological order (newest first)**:
 - `max_messages: 1` returns the most recent message
 - `max_messages: 20` returns the 20 most recent messages
-- More messages means going further back in time chronologically
+- More messages means going further back in time
