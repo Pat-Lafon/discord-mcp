@@ -15,31 +15,12 @@
 ## MCP Tools Implemented
 - **`get_servers`** - List all Discord servers you have access to
 - **`get_channels(server_id)`** - List all channels in a specific Discord server
-- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in reverse-chronological order (newest first)
+- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in reverse-chronological order (newest first): `max_messages: 1` is the most recent message, larger values reach further back in time
 - **`send_message(server_id, channel_id, content)`** - Send messages to specific Discord channels (automatically splits long messages)
 
-## Dependencies
-- **mcp** - Official MCP library via FastMCP
-- **playwright** - Browser automation for Discord web scraping
-- **python-dotenv** - Environment variable management
-- **pytest** - Testing framework
-
-## Test Strategy & Reliability
-The implementation prioritizes **reliability over speed** through:
-
-### Browser State Management
-- Complete browser reset between every MCP tool call using `_execute_with_fresh_client()`
-- Async lock serialization to prevent race conditions
+## Reliability
+- Complete browser reset between every MCP tool call using `_execute_with_fresh_client()`, with async-lock serialization to prevent races
 - Cookie persistence at `~/.discord_mcp_cookies.json` for login state
-
-### Message Extraction
-- **Chronological ordering**: Messages returned newest-first
-- **Robust scrolling**: JavaScript-based scroll to bottom for newest messages
-- **Proper filtering**: Time-based and count-based message limiting
-
-### Test Execution
-- Sequential test execution (`-n 0` in pytest.ini) to avoid resource conflicts
-- Comprehensive integration tests covering all 4 MCP tools
 
 ## Development Workflow
 1. Make changes following functional programming patterns
@@ -48,15 +29,6 @@ The implementation prioritizes **reliability over speed** through:
 4. Verify all 4 MCP tools work correctly
 
 ## Configuration
-Set environment variables:
-```env
-DISCORD_EMAIL=your_email@example.com
-DISCORD_PASSWORD=your_password
-DISCORD_HEADLESS=true  # For production
-```
+Deployed path: `../discord-mcp-launch` reads the macOS Keychain entry with service `discord-mcp` (account = Discord email, password via `-w`), exports `DISCORD_EMAIL` / `DISCORD_PASSWORD` / `DISCORD_HEADLESS` (default `true`), then execs the server. Rotate with `security add-generic-password -s discord-mcp -a "$EMAIL" -w '<new>' -U`.
 
-## Message Ordering Behavior
-Messages are returned in **reverse-chronological order (newest first)**:
-- `max_messages: 1` returns the most recent message
-- `max_messages: 20` returns the 20 most recent messages
-- More messages means going further back in time
+Local/dev: `src/discord_mcp/config.py` reads only env vars (loading a local `.env` if present) and raises if `DISCORD_EMAIL` / `DISCORD_PASSWORD` are missing.
