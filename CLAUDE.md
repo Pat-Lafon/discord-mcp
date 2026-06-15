@@ -1,8 +1,5 @@
 # Discord MCP Server (Python)
 
-## Code Quality
-- Always run `uv run pyright` for Python type checking
-
 ## Current Architecture
 - **`main.py`** - Entry point that starts the MCP server
 - **`src/discord_mcp/server.py`** - FastMCP server with 4 tool definitions
@@ -24,7 +21,7 @@
 
 ## Development Workflow
 1. Make changes following functional programming patterns
-2. Run `uv run pyright` for type checking
+2. Verify types with `uv run pyright`
 3. Run `uv run pytest -v tests/` for integration testing
 4. Verify all 4 MCP tools work correctly
 
