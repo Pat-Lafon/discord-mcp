@@ -12,8 +12,6 @@ dependencies = [
     "mcp>=1.9.3",
     "python-dotenv>=1.1.0",
     "typing-extensions>=4.14.0",
-    "pytest>=8.4.0",
-    "pytest-asyncio>=1.0.0",
 ]
 
 [project.scripts]
@@ -27,8 +25,4 @@ build-backend = "hatchling.build"
 dev = [
     "pyright>=1.1.401",
     "ruff>=0.11.13",
-]
-test = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.25.0",
 ]

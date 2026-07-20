@@ -17,6 +17,7 @@ from .client import (
     get_guild_channels,
     send_message as send_discord_message,
     close_client,
+    TransientLoginError,
 )
 from .config import load_config
 from .messages import read_recent_messages
@@ -61,7 +62,7 @@ async def _execute_with_persistent_client[T](
                 cfg.email, cfg.password, cfg.headless
             )
         else:
-            # Force _login to re-run _check_logged_in; it early-returns on logged_in=True.
+            # Force _login to re-probe login state; it early-returns on logged_in=True.
             discord_ctx.client_state = replace(
                 discord_ctx.client_state, logged_in=False
             )
@@ -75,7 +76,7 @@ async def _execute_with_persistent_client[T](
                 await close_client(discord_ctx.client_state)
                 discord_ctx.client_state = None
                 if attempt == 2 or not isinstance(
-                    e, (PlaywrightError, PlaywrightTimeoutError)
+                    e, (PlaywrightError, PlaywrightTimeoutError, TransientLoginError)
                 ):
                     raise
                 logger.warning(

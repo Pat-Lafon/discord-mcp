@@ -103,9 +103,6 @@ uvx ruff format .
 
 # Linting
 uvx ruff check --fix --unsafe-fixes .
-
-# Testing
-uv run pytest -v tests/
 ```
 
 ## Security Notes
