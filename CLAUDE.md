@@ -1,18 +1,8 @@
 # Discord MCP Server (Python)
 
-## Current Architecture
-- **`main.py`** - Entry point that starts the MCP server
-- **`src/discord_mcp/server.py`** - FastMCP server with 4 tool definitions
-- **`src/discord_mcp/client.py`** - Playwright-based Discord client with simplified message extraction
-- **`src/discord_mcp/config.py`** - Configuration management for Discord credentials
-- **`src/discord_mcp/messages.py`** - Message reading and time filtering logic
-- **`src/discord_mcp/logger.py`** - Logging setup and configuration
+## Architecture
 
-## MCP Tools Implemented
-- **`get_servers`** - List all Discord servers you have access to
-- **`get_channels(server_id)`** - List all channels in a specific Discord server
-- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in reverse-chronological order (newest first): `max_messages: 1` is the most recent message, larger values reach further back in time
-- **`send_message(server_id, channel_id, content)`** - Send messages to specific Discord channels (automatically splits long messages)
+Tool definitions and module layout live in `src/discord_mcp/server.py` (the entry point is `main.py`).
 
 ## Reliability
 - Complete browser reset between every MCP tool call using `_execute_with_fresh_client()`, with async-lock serialization to prevent races
