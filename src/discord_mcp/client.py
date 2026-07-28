@@ -482,7 +482,15 @@ async def get_channel_messages(
     limit: int = 100,
     before: str | None = None,
     after: str | None = None,
+    since: datetime | None = None,
 ) -> tuple[ClientState, list[DiscordMessage]]:
+    """Read a channel's (or thread's) recent messages, newest first.
+
+    `since` bounds the paging itself, not just the result: without it the loop
+    below pages back a fixed 10 times unless `limit` is reached, so a caller
+    wanting one day of a quiet channel still pays ten PageUps and a full
+    re-extraction each pass. Pass the window and the read costs one pass.
+    """
     state, page = await _open_channel(state, server_id, channel_id)
 
     # Scroll to bottom for newest messages
@@ -497,6 +505,7 @@ async def get_channel_messages(
     seen_ids = set()
     rows_seen = False
     extract_errors = 0
+    reached_since = False
 
     for _ in range(10):
         elements = await page.query_selector_all(
@@ -520,7 +529,14 @@ async def get_channel_messages(
             except Exception:
                 extract_errors += 1
                 continue
-            if message and message.id not in seen_ids:
+            if not message:
+                continue
+            # PageUp walks backward in time, so one message older than the
+            # window means every row further up is older too — the window is
+            # covered and another pass can only re-extract history.
+            if since and message.timestamp < since:
+                reached_since = True
+            if message.id not in seen_ids:
                 if before and message.id >= before:
                     continue
                 if after and message.id <= after:
@@ -528,7 +544,7 @@ async def get_channel_messages(
                 seen_ids.add(message.id)
                 messages.append(message)
 
-        if len(messages) >= limit:
+        if reached_since or len(messages) >= limit:
             break
         await page.keyboard.press("PageUp")
         await page.wait_for_timeout(1000)

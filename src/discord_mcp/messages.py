@@ -16,12 +16,15 @@ async def read_recent_messages(
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     logger.debug(f"Cutoff time set to: {cutoff_time}")
 
-    # Get messages in reverse-chronological order (newest first)
+    # Get messages in reverse-chronological order (newest first). The cutoff
+    # goes down so paging stops at the window's edge; the filter below still
+    # runs because the pass that reaches the edge overshoots it.
     state, all_messages = await get_channel_messages(
         state,
         server_id=server_id,
         channel_id=channel_id,
         limit=max_messages,
+        since=cutoff_time,
     )
     logger.debug(f"Retrieved {len(all_messages)} total messages")
 

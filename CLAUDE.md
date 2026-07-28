@@ -4,8 +4,10 @@
 
 Tool definitions and module layout live in `src/discord_mcp/server.py` (the entry point is `main.py`).
 
+`get_channel_messages` pages backward a fixed 10 screens, breaking early only once `limit` is reached — a cap a short time window never reaches, so a quiet channel otherwise costs all ten PageUps and a re-extraction of every rendered row per pass. Callers reading a time window pass `since` to stop at its edge instead; `read_recent_messages` does, which is what makes a multi-feed scrape affordable.
+
 ## Reliability
-- Complete browser reset between every MCP tool call using `_execute_with_fresh_client()`, with async-lock serialization to prevent races
+- One browser reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its page is closed or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an async lock serializes tool calls against the shared state
 - Cookie persistence at `~/.discord_mcp_cookies.json` for login state
 
 ## Login (cookie-only when headless)
