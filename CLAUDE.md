@@ -4,7 +4,7 @@
 
 Tool definitions and module layout live in `src/discord_mcp/server.py` (the entry point is `main.py`).
 
-`get_channel_messages` pages backward a fixed 10 screens, breaking early only once `limit` is reached — a cap a short time window never reaches, so a quiet channel otherwise costs all ten PageUps and a re-extraction of every rendered row per pass. Callers reading a time window pass `since` to stop at its edge instead; `read_recent_messages` does, which is what makes a multi-feed scrape affordable.
+`get_channel_messages` pages by jumping the feed's scroller to 0 each pass — that is the one gesture that triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within already-rendered rows, several presses short of the top, and loads nothing. The loop is bounded by progress, not a pass count: it stops at the window edge (`since`), at `limit`, or after three consecutive passes surfacing no new message. Stopping anywhere but the window edge logs a warning — benign when the feed is younger than the window (its top is inside it). Callers reading a time window pass `since`; `read_recent_messages` does, which is what makes a multi-feed scrape affordable.
 
 ## Reliability
 - One browser reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its page is closed or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an async lock serializes tool calls against the shared state

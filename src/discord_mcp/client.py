@@ -32,6 +32,19 @@ class DiscordMessage:
 
 
 @dc.dataclass(frozen=True)
+class WindowRead:
+    """A channel read plus whether paging confirmed it covered the window.
+
+    `reached_since` is True only when a message older than `since` was seen, so
+    False with a non-empty read means the feed's history ended — or paging
+    stalled — inside the window, and the caller cannot tell which from here.
+    """
+
+    messages: list[DiscordMessage]
+    reached_since: bool
+
+
+@dc.dataclass(frozen=True)
 class DiscordChannel:
     id: str
     name: str
@@ -483,13 +496,13 @@ async def get_channel_messages(
     before: str | None = None,
     after: str | None = None,
     since: datetime | None = None,
-) -> tuple[ClientState, list[DiscordMessage]]:
+) -> tuple[ClientState, WindowRead]:
     """Read a channel's (or thread's) recent messages, newest first.
 
-    `since` bounds the paging itself, not just the result: without it the loop
-    below pages back a fixed 10 times unless `limit` is reached, so a caller
-    wanting one day of a quiet channel still pays ten PageUps and a full
-    re-extraction each pass. Pass the window and the read costs one pass.
+    `since` bounds the paging itself, not just the result: one message older
+    than the window ends the loop. Without it the loop pages until `limit` is
+    reached or the feed stops yielding new rows, re-extracting every rendered
+    row each pass. Pass the window and a quiet channel costs one pass.
     """
     state, page = await _open_channel(state, server_id, channel_id)
 
@@ -506,17 +519,45 @@ async def get_channel_messages(
     rows_seen = False
     extract_errors = 0
     reached_since = False
+    stalled_passes = 0
 
-    for _ in range(10):
+    # Discord loads older history only when the feed's scroller reaches its
+    # top, and each loaded chunk prepends content that pushes the viewport
+    # back down, so the scroller is jumped straight to 0 each pass — one chunk
+    # (~20 rows) loads per jump. A keyboard PageUp is no substitute: it moves
+    # one viewport (~530px) within already-rendered rows, several presses
+    # short of the top, so nothing ever loads (measured 2026-07-30: rendered
+    # rows frozen at 50 across every pass).
+    scroll_to_top = """
+        () => {
+          const list = document.querySelector('[data-list-id="chat-messages"]');
+          let s = list;
+          while (s && s.scrollHeight <= s.clientHeight + 1) s = s.parentElement;
+          if (s) s.scrollTo(0, 0);
+        }
+    """
+
+    # Paging is bounded by progress, not a fixed pass count — a fixed cap
+    # silently truncates the old end of any window needing more passes than
+    # it. The loop stops at the window edge (`since`), at `limit`, or after
+    # three consecutive passes surfacing no new message — the top of the
+    # feed, or a stalled loader.
+    while stalled_passes < 3:
         elements = await page.query_selector_all(
             '[data-list-id="chat-messages"] [id^="chat-messages-"]'
         )
+        logger.debug(
+            f"pass: {len(elements)} rows rendered, {len(seen_ids)} unique so far,"
+            f" stalled={stalled_passes}"
+        )
         if not elements:
-            await page.keyboard.press("PageUp")
+            stalled_passes += 1
+            await page.evaluate(scroll_to_top)
             await page.wait_for_timeout(1000)
             continue
         rows_seen = True
 
+        known_before_pass = len(seen_ids)
         for element in reversed(elements):
             if len(messages) >= limit:
                 break
@@ -546,7 +587,8 @@ async def get_channel_messages(
 
         if reached_since or len(messages) >= limit:
             break
-        await page.keyboard.press("PageUp")
+        stalled_passes = 0 if len(seen_ids) > known_before_pass else stalled_passes + 1
+        await page.evaluate(scroll_to_top)
         await page.wait_for_timeout(1000)
 
     # Rows were present but every extraction attempt threw: the extractor is
@@ -558,7 +600,10 @@ async def get_channel_messages(
             " (likely a Discord DOM change)"
         )
 
-    return state, sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit]
+    return state, WindowRead(
+        messages=sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit],
+        reached_since=reached_since,
+    )
 
 
 # Discord renders a channel's active threads in the left sidebar grouped in a

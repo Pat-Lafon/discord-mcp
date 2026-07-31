@@ -132,7 +132,7 @@ async def read_messages(
             state, server_id, channel_id, hours_back, max_messages
         )
 
-    messages = await _execute_with_persistent_client(discord_ctx, operation)
+    window = await _execute_with_persistent_client(discord_ctx, operation)
     return [
         {
             "id": m.id,
@@ -141,7 +141,7 @@ async def read_messages(
             "timestamp": m.timestamp.isoformat(),
             "attachments": m.attachments,
         }
-        for m in messages
+        for m in window.messages
     ]
 
 

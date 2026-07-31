@@ -8,6 +8,9 @@ def setup_logger(
 ) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    # Importing the package pulls in the `mcp` library, which installs a bare
+    # root handler; propagation would emit every line a second time through it.
+    logger.propagate = False
 
     if logger.handlers:
         return logger
@@ -16,7 +19,10 @@ def setup_logger(
         "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
     )
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    # stderr, never stdout: stdout is the MCP stdio channel when running as a
+    # server, and the transcript channel for bin/discord_messages.py — a log
+    # line on stdout corrupts both.
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
