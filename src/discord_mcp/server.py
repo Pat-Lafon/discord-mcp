@@ -3,6 +3,7 @@ import typing as tp
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import (
@@ -12,10 +13,8 @@ from playwright.async_api import (
 from .logger import logger
 from .client import (
     ClientState,
-    create_client_state,
     get_guilds,
     get_guild_channels,
-    send_message as send_discord_message,
     close_client,
     TransientLoginError,
 )
@@ -58,7 +57,7 @@ async def _execute_with_persistent_client[T](
             await close_client(discord_ctx.client_state)
             discord_ctx.client_state = None
         if discord_ctx.client_state is None:
-            discord_ctx.client_state = create_client_state(
+            discord_ctx.client_state = ClientState(
                 cfg.email, cfg.password, cfg.headless
             )
         else:
@@ -82,7 +81,7 @@ async def _execute_with_persistent_client[T](
                 logger.warning(
                     "operation failed on attempt %s, retrying: %s", attempt, e
                 )
-                discord_ctx.client_state = create_client_state(
+                discord_ctx.client_state = ClientState(
                     cfg.email, cfg.password, cfg.headless
                 )
         raise RuntimeError("unreachable")
@@ -111,7 +110,7 @@ async def get_channels(server_id: str) -> list[dict[str, str]]:
         return await get_guild_channels(state, server_id)
 
     channels = await _execute_with_persistent_client(discord_ctx, operation)
-    return [{"id": c.id, "name": c.name, "type": str(c.type)} for c in channels]
+    return [{"id": c.id, "name": c.name} for c in channels]
 
 
 @mcp.tool()
@@ -126,10 +125,11 @@ async def read_messages(
 
     ctx = mcp.get_context()
     discord_ctx = tp.cast(DiscordContext, ctx.request_context.lifespan_context)
+    since = datetime.now(UTC) - timedelta(hours=hours_back)
 
     async def operation(state):
         return await read_recent_messages(
-            state, server_id, channel_id, hours_back, max_messages
+            state, server_id, channel_id, since, max_messages
         )
 
     window = await _execute_with_persistent_client(discord_ctx, operation)
@@ -143,91 +143,6 @@ async def read_messages(
         }
         for m in window.messages
     ]
-
-
-@mcp.tool()
-async def send_message(
-    server_id: str, channel_id: str, content: str
-) -> dict[str, tp.Any]:
-    """Send a message to a specific Discord channel. Long messages are automatically split."""
-    if len(content) == 0:
-        raise ValueError("Message content cannot be empty")
-
-    # Split long messages into chunks of 2000 characters or less
-    chunks = []
-    if len(content) <= 2000:
-        chunks = [content]
-    else:
-        # Split by newlines first to avoid breaking paragraphs
-        lines = content.split("\n")
-        current_chunk = ""
-
-        for line in lines:
-            # If single line is too long, split it by words
-            if len(line) > 2000:
-                words = line.split(" ")
-                current_line = ""
-                for word in words:
-                    if len(current_line + " " + word) <= 2000:
-                        current_line += (" " + word) if current_line else word
-                    else:
-                        if current_line:
-                            if len(current_chunk + "\n" + current_line) <= 2000:
-                                current_chunk += (
-                                    ("\n" + current_line)
-                                    if current_chunk
-                                    else current_line
-                                )
-                            else:
-                                chunks.append(current_chunk)
-                                current_chunk = current_line
-                            current_line = word
-                        else:
-                            # Single word too long, truncate it
-                            current_line = word[:2000]
-                if current_line:
-                    if len(current_chunk + "\n" + current_line) <= 2000:
-                        current_chunk += (
-                            ("\n" + current_line) if current_chunk else current_line
-                        )
-                    else:
-                        chunks.append(current_chunk)
-                        current_chunk = current_line
-            else:
-                # Normal line length
-                if len(current_chunk + "\n" + line) <= 2000:
-                    current_chunk += ("\n" + line) if current_chunk else line
-                else:
-                    chunks.append(current_chunk)
-                    current_chunk = line
-
-        if current_chunk:
-            chunks.append(current_chunk)
-
-    ctx = mcp.get_context()
-    discord_ctx = tp.cast(DiscordContext, ctx.request_context.lifespan_context)
-
-    message_ids = []
-    for i, chunk in enumerate(chunks):
-
-        async def operation(state, chunk_content=chunk):
-            return await send_discord_message(
-                state, server_id, channel_id, chunk_content
-            )
-
-        message_id = await _execute_with_persistent_client(discord_ctx, operation)
-        message_ids.append(message_id)
-
-        # Small delay between messages to avoid rate limiting
-        if i < len(chunks) - 1:
-            await asyncio.sleep(0.5)
-
-    return {
-        "message_ids": message_ids,
-        "status": "sent",
-        "chunks": len(chunks),
-        "total_length": len(content),
-    }
 
 
 def main():

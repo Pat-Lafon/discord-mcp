@@ -1,4 +1,3 @@
-import asyncio
 import dataclasses as dc
 import pathlib as pl
 from datetime import UTC, datetime
@@ -25,7 +24,6 @@ class DiscordMessage:
     id: str
     content: str
     author_name: str
-    author_id: str
     channel_id: str
     timestamp: datetime
     attachments: list[str]
@@ -44,16 +42,10 @@ class WindowRead:
     reached_since: bool
 
 
+# A thread is addressed exactly like a channel — same id space, same url shape,
+# same reader (`_open_channel`) — so `get_channel_threads` returns these too.
 @dc.dataclass(frozen=True)
 class DiscordChannel:
-    id: str
-    name: str
-    type: int
-    guild_id: str | None
-
-
-@dc.dataclass(frozen=True)
-class ThreadRef:
     id: str
     name: str
 
@@ -62,7 +54,6 @@ class ThreadRef:
 class DiscordGuild:
     id: str
     name: str
-    icon: str | None = None
 
 
 @dc.dataclass(frozen=True)
@@ -78,12 +69,6 @@ class ClientState:
     cookies_file: pl.Path = dc.field(
         default_factory=lambda: pl.Path.home() / ".discord_mcp_cookies.json"
     )
-
-
-def create_client_state(
-    email: str, password: str, headless: bool = True
-) -> ClientState:
-    return ClientState(email=email, password=password, headless=headless)
 
 
 async def _ensure_browser(state: ClientState) -> ClientState:
@@ -255,14 +240,12 @@ async def _login(state: ClientState) -> ClientState:
 
 async def close_client(state: ClientState) -> None:
     # Child before parent: a page/context must not outlive the browser it lives in.
-    resources = [
+    for resource, action in (
         (state.page, "close"),
         (state.context, "close"),
         (state.browser, "close"),
         (state.playwright, "stop"),
-    ]
-
-    for resource, action in resources:
+    ):
         try:
             if resource:
                 await getattr(resource, action)()
@@ -290,8 +273,16 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
             for (const item of rows) {
                 const id = item.getAttribute('data-list-item-id')?.replace('guildsnav___', '');
                 if (!id || !/^[0-9]+$/.test(id) || seen.has(id)) continue;
+                // A guild row renders as an icon, so its only text is the label
+                // written for screen readers — the name with any unread badge
+                // spelled into it. Measured 2026-08-11 over 10 guilds, the badge
+                // takes either end: "Unread messages, Dungeons of Purdue" and
+                // "Lets *Actually* Kill The Devil , 2 unread messages". Left in,
+                // it becomes part of the name and changes as messages arrive.
                 const name = (item.getAttribute('aria-label') || item.textContent || '')
+                    .replace(/^unread messages,\\s*/i, '')
                     .replace(/^\\d+\\s+(mentions?|notifications?|unread),?\\s*/i, '')
+                    .replace(/\\s*,\\s*\\d+\\s+unread\\s+messages?$/i, '')
                     .replace(/\\s+/g, ' ')
                     .trim();
                 if (name) {
@@ -306,17 +297,46 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
     for _ in range(25):  # ~15s ceiling at 600ms/poll
         guilds_data = await page.evaluate(extract)
         if guilds_data and len(guilds_data) == prev:
-            break
+            return state, [
+                DiscordGuild(id=g["id"], name=g["name"]) for g in guilds_data
+            ]
         prev = len(guilds_data)
         await page.wait_for_timeout(600)
-    else:
-        return state, []
 
-    guilds = [
-        DiscordGuild(id=g["id"], name=g["name"], icon=None) for g in guilds_data
-    ]
+    # A logged-in account is in at least one guild, so a rail that never settles
+    # on a positive count is a failed render or a Discord DOM change. Reporting
+    # zero guilds would read as "you belong to none" and be believed.
+    raise RuntimeError(
+        f"guild rail never settled ({prev} guild(s) on the last of 25 polls);"
+        " guild extractor is broken (likely a Discord DOM change)"
+    )
 
-    return state, guilds
+
+# Channel rows are read from their sidebar links: a `/channels/{guild}/{channel}`
+# href is what makes a link a channel, and the guild segment is compared rather
+# than interpolated into the pattern so the id never reaches a regex.
+_EXTRACT_CHANNELS_JS = r"""
+    (guildId) => {
+        const channels = new Map();
+        for (const link of document.querySelectorAll('a[href*="/channels/"]')) {
+            const match = link.href.match(/\/channels\/([0-9]+)\/([0-9]+)/);
+            if (!match || match[1] !== guildId || channels.has(match[2])) continue;
+            // The row's own text runs the channel type and its hover buttons
+            // together with the name ("TextannouncementsInvite to Channel",
+            // measured 2026-08-11), so read the name node when there is one and
+            // fall back to scrubbing the row only when there isn't.
+            const nameNode = link.querySelector('[class*="name"]');
+            let name = (nameNode ?? link).textContent?.trim() || '';
+            name = name.replace(/^[^a-zA-Z0-9#-_]+/, '').trim();
+            name = name.replace(/\s+/g, ' ').trim();
+            channels.set(match[2], {
+                id: match[2],
+                name: name || `channel-${match[2]}`,
+            });
+        }
+        return [...channels.values()];
+    }
+"""
 
 
 async def get_guild_channels(
@@ -330,36 +350,8 @@ async def get_guild_channels(
     )
     await page.wait_for_timeout(3000)
 
-    def extract_channels_js() -> str:
-        return f"""
-            (() => {{
-                const channels = [];
-                const seenIds = new Set();
-                const links = document.querySelectorAll('a[href*="/channels/"]');
-
-                links.forEach(link => {{
-                    const match = link.href.match(/\\/channels\\/{guild_id}\\/([0-9]+)/);
-                    if (match) {{
-                        const channelId = match[1];
-                        if (!seenIds.has(channelId)) {{
-                            seenIds.add(channelId);
-                            let name = link.textContent?.trim() || '';
-                            name = name.replace(/^[^a-zA-Z0-9#-_]+/, '').trim();
-                            name = name.replace(/\\s+/g, ' ').trim();
-                            channels.push({{
-                                id: channelId,
-                                name: name || `channel-${{channelId}}`,
-                                href: link.href
-                            }});
-                        }}
-                    }}
-                }});
-                return channels;
-            }})()
-        """
-
     logger.debug("Getting original channels")
-    original_channels = await page.evaluate(extract_channels_js())
+    original_channels = await page.evaluate(_EXTRACT_CHANNELS_JS, guild_id)
     logger.debug(f"Found {len(original_channels)} original channels")
 
     # The initial sidebar scrape can miss channels; opening Browse Channels
@@ -382,88 +374,188 @@ async def get_guild_channels(
             """)
             await page.wait_for_timeout(3000)
 
-            browse_channels = await page.evaluate(extract_channels_js())
+            browse_channels = await page.evaluate(_EXTRACT_CHANNELS_JS, guild_id)
             logger.debug(f"Found {len(browse_channels)} browse channels")
     except Exception as e:
-        logger.debug(f"Browse Channels failed: {e}")
+        # Enrichment, so a failure still returns the sidebar's channels — but at
+        # warning level, or a Browse Channels that quietly stops working shows
+        # up only as channels missing from the result.
+        logger.warning(f"Browse Channels failed: {e}")
 
-    all_channels = {}
-    final_channels = []
+    by_id: dict[str, dict] = {}
+    for ch in [*original_channels, *browse_channels]:
+        by_id.setdefault(ch["id"], ch)
+    logger.debug(f"Total unique channels: {len(by_id)}")
 
-    for ch in original_channels:
-        all_channels[ch["id"]] = ch
-        final_channels.append(ch)
-
-    for ch in browse_channels:
-        if ch["id"] not in all_channels:
-            final_channels.append(ch)
-
-    logger.debug(f"Total unique channels: {len(final_channels)}")
-
-    channels = [
-        DiscordChannel(id=ch["id"], name=ch["name"], type=0, guild_id=guild_id)
-        for ch in final_channels
+    return state, [
+        DiscordChannel(id=ch["id"], name=ch["name"]) for ch in by_id.values()
     ]
 
-    return state, channels
+
+# Every rendered row, read in one pass over the document: per-row would be a
+# round trip each, and the paging loop re-reads every rendered row every pass.
+# Discord hashes its class names (`markup__75297`), so selectors match a
+# substring.
+#
+# A reply row nests a preview of the quoted message — author name and text —
+# ahead of its own, in nodes class-identical to the real ones (measured
+# 2026-08-11 over 436 rows), so only the `repliedMessage` ancestor tells them
+# apart. Every lookup below ignores that subtree, or a reply reports the message
+# it quotes in place of itself and hands that author to the continuations under
+# it.
+#
+# A row that throws comes back as null rather than losing the pass, so one
+# malformed row is tolerated while a DOM change that trips every row still
+# reaches the caller's canary.
+_EXTRACT_ROWS_JS = """
+() => {
+  const own = (el) => !el.closest('[class*="repliedMessage"]');
+  // Discord renders every emoji as an <img> whose alt carries what was typed —
+  // the character for a unicode emoji, `:name:` for a custom one — so
+  // textContent alone drops it (measured 2026-08-11: 9 messages lost a
+  // mid-sentence emoji, 3 emoji-only messages read as empty).
+  //
+  // Chrome that Discord nests *inside* the content node is dropped first, or it
+  // reads as message text: a `timestamp` span holds the `(edited)` marker plus
+  // the same instant spelled out for screen readers, and `hiddenVisually` spans
+  // hold separators meant only to be read aloud (measured 2026-08-11 over 57
+  // content nodes: 2 ended in "(edited)Sunday, July 19, 2026 at 8:06 PM", 5
+  // carried a stray comma). Both are addressed to a screen reader or duplicate
+  // what the row's id already dates, so nothing is lost by removing them.
+  const readText = (el) => {
+    const clone = el.cloneNode(true);
+    for (const chrome of clone.querySelectorAll(
+        '[class*="timestamp"], [class*="hiddenVisually"]')) {
+      chrome.remove();
+    }
+    for (const img of clone.querySelectorAll('img[alt]')) {
+      img.replaceWith(img.getAttribute('alt'));
+    }
+    return clone.textContent.trim();
+  };
+  // First own match holding text. Scanning past the empty ones is what reads a
+  // forward: Discord leaves the row's own content node empty and puts the
+  // forwarded body in a second one below it (6 such rows, 2026-08-11).
+  const firstNode = (root, selector) =>
+    [...root.querySelectorAll(selector)].find((el) => own(el) && readText(el));
+  const textOf = (root, selector) => {
+    const el = firstNode(root, selector);
+    return el ? readText(el) : "";
+  };
+
+  // A poll's question and options are their own component, outside the content
+  // node, so without this a poll row's text reads as empty.
+  const pollOf = (row) => {
+    const box = row.querySelector('[class*="pollContainer"]');
+    if (!box) return null;
+    return {
+      question: textOf(box, 'h4'),
+      options: [...box.querySelectorAll('li[class*="answer__"]')].map((li) => ({
+        label: textOf(li, '[class*="label__"]'),
+        votes: textOf(li, '[class*="votesData"] [class*="text__"]'),
+      })),
+    };
+  };
+
+  const rows = document.querySelectorAll(
+      '[data-list-id="chat-messages"] [id^="chat-messages-"]');
+  return [...rows].map((row) => {
+    try {
+      const contentEl = firstNode(row, '[class*="markup"]');
+      // Discord marks a forward with a quote spine sitting *beside* the
+      // snapshot's content rather than wrapping it, so the snapshot's root is
+      // that spine's parent. A comment the author added sits in a content node
+      // of its own ahead of the snapshot, so it is read first and goes
+      // unmarked. `quote__` is specific to this spine — a markdown blockquote
+      // is `blockquoteContainer__`/`blockquoteDivider__` (2026-08-11).
+      const forwarded = !!contentEl
+          && [...row.querySelectorAll('[class*="quote__"]')]
+              .some((spine) => spine.parentElement.contains(contentEl));
+      // A link or video posted with no text puts the URL nowhere but the
+      // unfurl's anchor. Attachments already carry the cdn links, so excluding
+      // them here keeps such a row from reporting its file twice.
+      const link = [...row.querySelectorAll(
+          'a[href^="http"]:not([href*="cdn.discordapp.com"])')].find(own);
+      return {
+        // `chat-messages-{channelId}-{messageId}` — the trailing segment is the
+        // snowflake the caller dates the row from. A thread's opening banner
+        // carries the thread's own id there instead of a message's.
+        id: row.id.split('-').pop(),
+        authorName: textOf(row, '[class*="username"]') || null,
+        content: contentEl ? readText(contentEl) : "",
+        forwarded: forwarded,
+        poll: pollOf(row),
+        link: link ? link.getAttribute('href') : null,
+        attachments: [...row.querySelectorAll('a[href*="cdn.discordapp.com"]')]
+            .filter(own).map(a => a.getAttribute('href')),
+      };
+    } catch (e) {
+      return null;
+    }
+  });
+}
+"""
 
 
-# Returns None for a row with no content and no attachments (a system/embed row
-# we skip) — a legitimate empty, distinct from a parse failure. Errors are NOT
-# swallowed here: they propagate so the caller can count them and tell "one bad
-# row" apart from "the extractor is broken" (see get_channel_messages).
-async def _extract_message_data(
-    element, channel_id: str, collected: int
-) -> DiscordMessage | None:
-    message_id = (
-        await element.get_attribute("id") or f"message-{collected}"
-    ).replace("chat-messages-", "")
+def _content(raw: dict) -> str:
+    """What the message says, as one string. A poll and a bare link say it
+    outside the content node, so each is rendered here rather than carried as
+    its own field — `content` is the whole contract every consumer reads."""
+    body = raw["content"]
+    if not body and (poll := raw["poll"]):
+        body = "\n".join(
+            [f"**Poll: {poll['question']}**"]
+            + [f"- {o['label']} — {o['votes']}" for o in poll["options"]]
+        )
+    if not body and raw["link"]:
+        body = raw["link"]
+    if body and raw["forwarded"]:
+        body = f"_Forwarded:_\n{body}"
+    return body
 
-    content = ""
-    for selector in [
-        '[class*="messageContent"]',
-        '[class*="markup"]',
-        ".messageContent",
-    ]:
-        content_elem = await element.query_selector(selector)
-        if content_elem and (text := await content_elem.text_content()):
-            content = text.strip()
-            break
 
-    author_name = "Unknown"
-    for selector in ['[class*="username"]', '[class*="authorName"]', ".username"]:
-        author_elem = await element.query_selector(selector)
-        if author_elem and (name := await author_elem.text_content()):
-            author_name = name.strip()
-            break
+# Discord ids are snowflakes: the high 42 bits are milliseconds since
+# 2015-01-01, so an id carries its own post time. Dating a row from its id
+# rather than its `<time>` element leaves nothing to guess at — a row cannot
+# exist without an id, where a missing datetime would date it to now and so
+# read as inside every window.
+_SNOWFLAKE_EPOCH_MS = 1420070400000
 
-    timestamp_elem = await element.query_selector("time")
-    timestamp_str = (
-        await timestamp_elem.get_attribute("datetime") if timestamp_elem else None
+
+def _posted_at(message_id: str) -> datetime:
+    return datetime.fromtimestamp(
+        ((int(message_id) >> 22) + _SNOWFLAKE_EPOCH_MS) / 1000, UTC
     )
-    timestamp = (
-        datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-        if timestamp_str
-        else datetime.now(UTC)
-    )
 
-    attachments = [
-        href
-        for att in await element.query_selector_all('a[href*="cdn.discordapp.com"]')
-        if (href := await att.get_attribute("href"))
-    ]
 
-    if not content and not attachments:
-        return None
+@dc.dataclass(frozen=True)
+class _Obs:
+    """A row as the passes so far have managed to read it. Each field defaults
+    to empty and stays that way until some pass supplies it."""
 
+    author_name: str | None = None
+    content: str = ""
+    attachments: list[str] = dc.field(default_factory=list)
+
+    def complete(self) -> bool:
+        """Whether the sightings so far amount to a reportable message. Both
+        ways of falling short — no author resolved, or no text and no attachment
+        read — are answers a later pass can still change, so this is asked of
+        the accumulated set after each pass rather than of a row as it lands."""
+        return self.author_name is not None and bool(self.content or self.attachments)
+
+
+def _message(message_id: str, obs: _Obs, channel_id: str) -> DiscordMessage:
+    """The message a complete `_Obs` amounts to. Call only where `complete()`
+    holds — the author is non-None exactly there."""
+    assert obs.author_name is not None
     return DiscordMessage(
         id=message_id,
-        content=content,
-        author_name=author_name,
-        author_id="unknown",
+        content=obs.content,
+        author_name=obs.author_name,
         channel_id=channel_id,
-        timestamp=timestamp,
-        attachments=attachments,
+        timestamp=_posted_at(message_id),
+        attachments=obs.attachments,
     )
 
 
@@ -492,17 +584,15 @@ async def get_channel_messages(
     state: ClientState,
     server_id: str,
     channel_id: str,
+    since: datetime,
     limit: int = 100,
-    before: str | None = None,
-    after: str | None = None,
-    since: datetime | None = None,
 ) -> tuple[ClientState, WindowRead]:
-    """Read a channel's (or thread's) recent messages, newest first.
+    """Read a channel's (or thread's) messages back to `since`, newest first.
 
     `since` bounds the paging itself, not just the result: one message older
-    than the window ends the loop. Without it the loop pages until `limit` is
-    reached or the feed stops yielding new rows, re-extracting every rendered
-    row each pass. Pass the window and a quiet channel costs one pass.
+    than the window ends the loop, so a quiet channel costs one pass. `limit`
+    caps what comes back and stops paging early, standing in for the window on
+    a feed busy enough to make covering it unaffordable.
     """
     state, page = await _open_channel(state, server_id, channel_id)
 
@@ -514,20 +604,15 @@ async def get_channel_messages(
     """)
     await page.wait_for_timeout(2000)
 
-    messages = []
-    seen_ids = set()
-    rows_seen = False
+    seen: dict[str, _Obs] = {}
     extract_errors = 0
     reached_since = False
     stalled_passes = 0
 
-    # Discord loads older history only when the feed's scroller reaches its
-    # top, and each loaded chunk prepends content that pushes the viewport
-    # back down, so the scroller is jumped straight to 0 each pass — one chunk
-    # (~20 rows) loads per jump. A keyboard PageUp is no substitute: it moves
-    # one viewport (~530px) within already-rendered rows, several presses
-    # short of the top, so nothing ever loads (measured 2026-07-30: rendered
-    # rows frozen at 50 across every pass).
+    # Discord loads older history only when the feed's scroller reaches its top,
+    # and each chunk prepends content that pushes the viewport back down, so the
+    # scroller is jumped to 0 each pass. A keyboard PageUp moves one viewport
+    # within already-rendered rows and loads nothing (measured 2026-07-30).
     scroll_to_top = """
         () => {
           const list = document.querySelector('[data-list-id="chat-messages"]');
@@ -537,63 +622,75 @@ async def get_channel_messages(
         }
     """
 
-    # Paging is bounded by progress, not a fixed pass count — a fixed cap
-    # silently truncates the old end of any window needing more passes than
-    # it. The loop stops at the window edge (`since`), at `limit`, or after
-    # three consecutive passes surfacing no new message — the top of the
-    # feed, or a stalled loader.
+    # Bounded by progress, not a fixed pass count, which would silently truncate
+    # the old end of any window needing more passes than the cap.
     while stalled_passes < 3:
-        elements = await page.query_selector_all(
-            '[data-list-id="chat-messages"] [id^="chat-messages-"]'
-        )
+        extracted = await page.evaluate(_EXTRACT_ROWS_JS)
         logger.debug(
-            f"pass: {len(elements)} rows rendered, {len(seen_ids)} unique so far,"
+            f"pass: {len(extracted)} rows rendered, {len(seen)} unique so far,"
             f" stalled={stalled_passes}"
         )
-        if not elements:
-            stalled_passes += 1
-            await page.evaluate(scroll_to_top)
-            await page.wait_for_timeout(1000)
-            continue
-        rows_seen = True
-
-        known_before_pass = len(seen_ids)
-        for element in reversed(elements):
-            if len(messages) >= limit:
-                break
-            # Tolerate a single malformed row, but count the failure — a broken
-            # extractor (DOM change) trips every row and is caught by the canary.
-            try:
-                message = await _extract_message_data(
-                    element, channel_id, len(seen_ids)
-                )
-            except Exception:
+        known_before_pass = len(seen)
+        # Oldest first: Discord omits the username header on a run of messages
+        # from one author, so an unnamed row takes the nearest name above it.
+        # Carried over rendered rows, since an unreadable row (a poll, measured
+        # 2026-08-11) can be a run's only named one.
+        carried: str | None = None
+        for raw in extracted:
+            # A broken extractor (DOM change) nulls every row; the canary below
+            # turns that into a failure rather than an empty channel.
+            if raw is None:
                 extract_errors += 1
                 continue
-            if not message:
+            author = raw["authorName"] or carried
+            carried = author
+            # A thread's opening banner is the one rendered row that is no
+            # message; Discord gives it the thread's own id. Dropped before the
+            # window check, since that id dates it to the thread's creation.
+            if raw["id"] == channel_id:
                 continue
-            # PageUp walks backward in time, so one message older than the
-            # window means every row further up is older too — the window is
-            # covered and another pass can only re-extract history.
-            if since and message.timestamp < since:
+            # Rows walk backward in time, so one past the edge means the window
+            # is covered — asked of every row, readable or not.
+            if _posted_at(raw["id"]) < since:
                 reached_since = True
-            if message.id not in seen_ids:
-                if before and message.id >= before:
-                    continue
-                if after and message.id <= after:
-                    continue
-                seen_ids.add(message.id)
-                messages.append(message)
+            # Merge rather than overwrite or skip-if-known: a row is re-extracted
+            # every pass and yields more as history loads above it, so a later
+            # pass can supply an author an earlier one had no group start for.
+            prior = seen.get(raw["id"], _Obs())
+            seen[raw["id"]] = _Obs(
+                author_name=author or prior.author_name,
+                content=_content(raw) or prior.content,
+                attachments=raw["attachments"] or prior.attachments,
+            )
 
-        if reached_since or len(messages) >= limit:
+        # Counted over the whole set: this pass may have completed a message
+        # first sighted several passes ago.
+        if reached_since or sum(o.complete() for o in seen.values()) >= limit:
             break
-        stalled_passes = 0 if len(seen_ids) > known_before_pass else stalled_passes + 1
+        stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
         await page.evaluate(scroll_to_top)
         await page.wait_for_timeout(1000)
 
-    # Rows were present but every extraction attempt threw: the extractor is
-    # broken, not the channel empty. Fail loud rather than report zero messages.
-    if rows_seen and not messages and extract_errors:
+    messages = [_message(i, o, channel_id) for i, o in seen.items() if o.complete()]
+
+    # An unreadable row inside the window is a gap in the record, named rather
+    # than dropped quietly. The two reasons want different fixes: no author means
+    # paging stopped below the row naming that run, no content means the
+    # selectors missed text that is on the page.
+    gaps = {
+        i: "no author" if o.author_name is None else "no content"
+        for i, o in sorted(seen.items())
+        if not o.complete() and _posted_at(i) >= since
+    }
+    if gaps:
+        logger.warning(
+            f"channel {channel_id}: dropped {len(gaps)} unreadable row(s) in the"
+            f" window: {', '.join(f'{i} ({why})' for i, why in [*gaps.items()][:5])}"
+        )
+
+    # Rows were present but every extraction threw: the extractor is broken, not
+    # the channel empty.
+    if not messages and extract_errors:
         raise RuntimeError(
             f"channel {channel_id}: saw message rows but extracted 0 messages"
             f" ({extract_errors} extraction errors); message extractor is broken"
@@ -636,7 +733,7 @@ _THREAD_SCRAPE_JS = r"""
 
 async def get_channel_threads(
     state: ClientState, server_id: str, channel_id: str
-) -> tuple[ClientState, list[ThreadRef]]:
+) -> tuple[ClientState, list[DiscordChannel]]:
     """Discover a channel's active threads from Discord's own sidebar thread
     index (see `_THREAD_SCRAPE_JS`), read after navigating to the channel so it
     is the selected one whose thread group is rendered. Unlike the old
@@ -663,31 +760,8 @@ async def get_channel_threads(
         ) from e
 
     threads = [
-        ThreadRef(id=row["id"], name=row["name"] or f"thread-{row['id']}")
+        DiscordChannel(id=row["id"], name=row["name"] or f"thread-{row['id']}")
         for row in await page.evaluate(_THREAD_SCRAPE_JS, channel_id)
     ]
     logger.debug(f"Discovered {len(threads)} thread(s) under channel {channel_id}")
     return state, threads
-
-
-async def send_message(
-    state: ClientState, server_id: str, channel_id: str, content: str
-) -> tuple[ClientState, str]:
-    state = await _login(state)
-    page = _require_page(state)
-
-    await page.goto(
-        f"https://discord.com/channels/{server_id}/{channel_id}",
-        wait_until="domcontentloaded",
-    )
-    await page.wait_for_selector('[data-slate-editor="true"]', timeout=10000)
-
-    message_input = await page.query_selector('[data-slate-editor="true"]')
-    if not message_input:
-        raise RuntimeError("Could not find message input")
-
-    await message_input.fill(content)
-    await page.keyboard.press("Enter")
-    await asyncio.sleep(1)
-
-    return state, f"sent-{int(datetime.now().timestamp())}"
