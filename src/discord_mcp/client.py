@@ -5,15 +5,11 @@ from datetime import UTC, datetime
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Error as PlaywrightError,
     Page,
     Playwright,
-    async_playwright,
-)
-from playwright.async_api import (
-    Error as PlaywrightError,
-)
-from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
 )
 
 from .logger import logger
@@ -106,11 +102,9 @@ def _require_page(state: ClientState) -> Page:
 class LoginState: ...
 
 
-@dc.dataclass(frozen=True)
 class LoggedIn(LoginState): ...
 
 
-@dc.dataclass(frozen=True)
 class LoggedOut(LoginState): ...
 
 
@@ -240,12 +234,14 @@ async def _login(state: ClientState) -> ClientState:
 
 async def close_client(state: ClientState) -> None:
     # Child before parent: a page/context must not outlive the browser it lives in.
-    for resource, action in (
+    resources = [
         (state.page, "close"),
         (state.context, "close"),
         (state.browser, "close"),
         (state.playwright, "stop"),
-    ):
+    ]
+
+    for resource, action in resources:
         try:
             if resource:
                 await getattr(resource, action)()
@@ -257,9 +253,7 @@ async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild
     state = await _login(state)
     page = _require_page(state)
 
-    await page.goto(
-        "https://discord.com/channels/@me", wait_until="domcontentloaded"
-    )
+    await page.goto("https://discord.com/channels/@me", wait_until="domcontentloaded")
 
     # The guild rail loads in one jump *after* the non-guild chrome renders, so
     # waiting on a treeitem fires too early and extracts nothing — poll instead,
@@ -358,9 +352,7 @@ async def get_guild_channels(
     # surfaces the rest, deduped against the first set below.
     browse_channels = []
     try:
-        browse_element = await page.query_selector(
-            '*:has-text("Browse Channels")'
-        )
+        browse_element = await page.query_selector('*:has-text("Browse Channels")')
         if browse_element and await browse_element.is_visible():
             await browse_element.click()
             await page.wait_for_timeout(5000)

@@ -1,7 +1,6 @@
 import os
 import typing as tp
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 

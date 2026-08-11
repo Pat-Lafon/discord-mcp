@@ -50,39 +50,31 @@ async def _execute_with_persistent_client[T](
     """Execute Discord operation with a persistent client, retrying once on Playwright errors."""
     cfg = discord_ctx.config
     async with discord_ctx.client_lock:
-        if discord_ctx.client_state is not None and (
-            discord_ctx.client_state.page is None
-            or discord_ctx.client_state.page.is_closed()
-        ):
-            await close_client(discord_ctx.client_state)
-            discord_ctx.client_state = None
-        if discord_ctx.client_state is None:
-            discord_ctx.client_state = ClientState(
-                cfg.email, cfg.password, cfg.headless
-            )
-        else:
-            # Force _login to re-probe login state; it early-returns on logged_in=True.
-            discord_ctx.client_state = replace(
-                discord_ctx.client_state, logged_in=False
-            )
+        state = discord_ctx.client_state
+        if state is not None:
+            if state.page is None or state.page.is_closed():
+                await close_client(state)
+                state = None
+            else:
+                # Force _login to re-probe login state; it early-returns on logged_in=True.
+                state = replace(state, logged_in=False)
 
         for attempt in (1, 2):
+            if state is None:
+                state = ClientState(cfg.email, cfg.password, cfg.headless)
             try:
-                new_state, result = await operation(discord_ctx.client_state)
-                discord_ctx.client_state = new_state
+                state, result = await operation(state)
+                discord_ctx.client_state = state
                 return result
             except Exception as e:
-                await close_client(discord_ctx.client_state)
-                discord_ctx.client_state = None
+                await close_client(state)
+                state = discord_ctx.client_state = None
                 if attempt == 2 or not isinstance(
                     e, (PlaywrightError, PlaywrightTimeoutError, TransientLoginError)
                 ):
                     raise
                 logger.warning(
                     "operation failed on attempt %s, retrying: %s", attempt, e
-                )
-                discord_ctx.client_state = ClientState(
-                    cfg.email, cfg.password, cfg.headless
                 )
         raise RuntimeError("unreachable")
 
