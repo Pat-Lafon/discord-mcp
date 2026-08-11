@@ -132,20 +132,19 @@ def _is_auth_url(url: str) -> bool:
 async def _probe_login_state(
     state: ClientState, *, guild_nav_timeout_ms: int = 20000
 ) -> LoginState:
-    if not state.page:
-        return Indeterminate("browser page not initialized")
+    page = _require_page(state)
     try:
-        await state.page.goto(
+        await page.goto(
             "https://discord.com/channels/@me", wait_until="domcontentloaded"
         )
-    except (PlaywrightError, PlaywrightTimeoutError) as e:
+    except PlaywrightError as e:
         return Indeterminate(f"navigation to /channels/@me failed: {e}")
 
-    if _is_auth_url(state.page.url):
+    if _is_auth_url(page.url):
         return LoggedOut()
 
     try:
-        await state.page.wait_for_selector(
+        await page.wait_for_selector(
             '[data-list-id="guildsnav"] [role="treeitem"]',
             state="visible",
             timeout=guild_nav_timeout_ms,
@@ -153,11 +152,10 @@ async def _probe_login_state(
     except PlaywrightTimeoutError:
         # A late redirect to /login can land while we wait on the nav, so recheck
         # the url before calling it indeterminate.
-        if _is_auth_url(state.page.url):
+        if _is_auth_url(page.url):
             return LoggedOut()
         return Indeterminate(
-            f"guild nav not visible within {guild_nav_timeout_ms}ms"
-            f" (url={state.page.url})"
+            f"guild nav not visible within {guild_nav_timeout_ms}ms (url={page.url})"
         )
     except PlaywrightError as e:
         return Indeterminate(f"guild nav probe errored: {e}")
@@ -190,7 +188,7 @@ async def _perform_credential_login(state: ClientState) -> ClientState:
         await page.wait_for_function(
             "() => !window.location.href.includes('/login')", timeout=60000
         )
-    except (PlaywrightError, PlaywrightTimeoutError) as e:
+    except PlaywrightError as e:
         raise TransientLoginError(f"login did not complete: {e}") from e
 
     probe = await _probe_login_state(state, guild_nav_timeout_ms=30000)
@@ -536,8 +534,8 @@ class _Obs:
 
 
 def _message(message_id: str, obs: _Obs, channel_id: str) -> DiscordMessage:
-    """The message a complete `_Obs` amounts to. Call only where `complete()`
-    holds — the author is non-None exactly there."""
+    """The message a complete `_Obs` amounts to; the assert is what narrows
+    `author_name` for the type checker."""
     assert obs.author_name is not None
     return DiscordMessage(
         id=message_id,

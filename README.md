@@ -62,7 +62,7 @@ DISCORD_HEADLESS=true
 
 ### Run Server
 ```bash
-uv run python main.py
+uv run discord-mcp
 ```
 
 ## Claude Desktop Integration

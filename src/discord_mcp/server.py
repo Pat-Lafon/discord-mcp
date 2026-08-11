@@ -6,10 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
-from playwright.async_api import (
-    Error as PlaywrightError,
-    TimeoutError as PlaywrightTimeoutError,
-)
+from playwright.async_api import Error as PlaywrightError
 from .logger import logger
 from .client import (
     ClientState,
@@ -70,7 +67,7 @@ async def _execute_with_persistent_client[T](
                 await close_client(state)
                 state = discord_ctx.client_state = None
                 if attempt == 2 or not isinstance(
-                    e, (PlaywrightError, PlaywrightTimeoutError, TransientLoginError)
+                    e, (PlaywrightError, TransientLoginError)
                 ):
                     raise
                 logger.warning(
