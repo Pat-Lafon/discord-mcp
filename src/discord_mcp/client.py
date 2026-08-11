@@ -1,7 +1,6 @@
-import dataclasses as dc
 import pathlib as pl
 from datetime import UTC, datetime
-
+import dataclasses as dc
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -11,7 +10,6 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
-
 from .logger import logger
 
 
