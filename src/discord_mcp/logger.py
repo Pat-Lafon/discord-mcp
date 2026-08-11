@@ -7,8 +7,9 @@ def setup_logger(
 ) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    # Importing the package pulls in the `mcp` library, which installs a bare
-    # root handler; propagation would emit every line a second time through it.
+    # In the server process the root logger carries a bare `%(message)s` handler
+    # that FastMCP's constructor installs; propagation would emit every line a
+    # second time through it, stripped of the timestamp and call site.
     logger.propagate = False
 
     if logger.handlers:

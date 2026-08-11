@@ -2,7 +2,9 @@
 
 ## Architecture
 
-Tool definitions and module layout live in `src/discord_mcp/server.py` (the entry point is `main.py`).
+Tool definitions and module layout live in `src/discord_mcp/server.py`. The `discord-mcp` console script resolves to `discord_mcp:main`, which imports `server` inside the function body: `server` builds its FastMCP at module scope, and that constructor installs a bare `%(message)s` handler on the root logger, so a client-only import (`../bin/discord_messages.py` takes `.client` and `.messages`) must not reach it.
+
+`logger.py` configures the `discord_mcp` logger at import — DEBUG, stderr, `propagate = False` — and every consumer wants that: the MCP server logs to Claude Code's server log, the daily review captures the stream as its trace file (the only record of per-feed counts and paging timings), and an ad-hoc client drive is how this repo is tested. stdout is reserved: it is the MCP stdio channel here and the transcript channel in `../bin/discord_messages.py`.
 
 `get_channel_messages` pages by jumping the feed's scroller to 0 each pass — that is the one gesture that triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within already-rendered rows, several presses short of the top, and loads nothing. The loop is bounded by progress, not a pass count: it stops at the window edge (`since`, required), at `limit`, or after three consecutive passes surfacing no new row. Stopping anywhere but the window edge logs a warning — benign when the feed is younger than the window (its top is inside it).
 
