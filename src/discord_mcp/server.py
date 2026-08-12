@@ -56,7 +56,8 @@ async def _execute_with_persistent_client[T](
                 # Force _login to re-probe login state; it early-returns on logged_in=True.
                 state = replace(state, logged_in=False)
 
-        for attempt in (1, 2):
+        retried = False
+        while True:
             if state is None:
                 state = ClientState(cfg.email, cfg.password, cfg.headless)
             try:
@@ -66,14 +67,10 @@ async def _execute_with_persistent_client[T](
             except Exception as e:
                 await close_client(state)
                 state = discord_ctx.client_state = None
-                if attempt == 2 or not isinstance(
-                    e, (PlaywrightError, TransientLoginError)
-                ):
+                if retried or not isinstance(e, (PlaywrightError, TransientLoginError)):
                     raise
-                logger.warning(
-                    "operation failed on attempt %s, retrying: %s", attempt, e
-                )
-        raise RuntimeError("unreachable")
+                retried = True
+                logger.warning("operation failed, retrying: %s", e)
 
 
 mcp = FastMCP("discord-mcp", lifespan=discord_lifespan)
