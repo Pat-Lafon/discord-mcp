@@ -11,13 +11,25 @@ A Model Context Protocol (MCP) server that lets LLMs read messages, discover cha
 
 ## Quick Start with Claude Code
 
-```bash
-# Add Discord MCP server
-claude mcp add discord-mcp -s user -e DISCORD_EMAIL=your_email@example.com -e DISCORD_PASSWORD=your_password -e DISCORD_HEADLESS=true -- uvx --from git+https://github.com/elyxlz/discord-mcp.git discord-mcp
+Login restores the session from a persisted cookie (`~/.discord_mcp_cookies.json`).
+Headless with that cookie missing or expired raises `CookieExpiredError` instead of
+submitting the credentials: a fresh headless login trips Discord's device verification,
+which needs a human at a visible browser. `DISCORD_EMAIL` and `DISCORD_PASSWORD` are
+read on the headed path only, so seed the cookie headed once and run headless after.
 
-# Start Claude Code
+```bash
+# 1. Seed the cookie — headed, so the sign-in and any verification prompt are clickable
+claude mcp add discord-mcp -s user -e DISCORD_EMAIL=your_email@example.com -e DISCORD_PASSWORD=your_password -e DISCORD_HEADLESS=false -- uvx --from git+https://github.com/elyxlz/discord-mcp.git discord-mcp
 claude
+> use get_servers to show me all my Discord servers
+# A browser window opens. Sign in there; the cookie is written when the session confirms.
+
+# 2. Switch to headless for normal use — the cookie is what it runs on
+claude mcp remove discord-mcp -s user
+claude mcp add discord-mcp -s user -e DISCORD_EMAIL=your_email@example.com -e DISCORD_PASSWORD=your_password -e DISCORD_HEADLESS=true -- uvx --from git+https://github.com/elyxlz/discord-mcp.git discord-mcp
 ```
+
+Repeat step 1 whenever the cookie expires.
 
 ### Usage Examples
 
@@ -41,7 +53,7 @@ claude
 ## Manual Setup
 
 ### Prerequisites
-- Python 3.10+ with `uv` package manager
+- Python 3.12+ with `uv` package manager
 - Discord account credentials
 
 ### Installation
@@ -59,6 +71,9 @@ DISCORD_EMAIL=your_email@example.com
 DISCORD_PASSWORD=your_password
 DISCORD_HEADLESS=true
 ```
+
+Set `DISCORD_HEADLESS=false` for the first run — and any run after the cookie expires —
+so the sign-in happens at a visible browser.
 
 ### Run Server
 ```bash
@@ -84,31 +99,38 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
+Claude Desktop has no headed browser of its own to sign in at, so seed the cookie from a
+terminal first (Quick Start step 1, or `DISCORD_HEADLESS=false uv run discord-mcp` driven
+by any client). Both read the same `~/.discord_mcp_cookies.json`.
+
 ## Development
 
+What `.github/workflows/pr-checks.yml` gates a PR on:
+
 ```bash
-# Type checking
 uv run pyright
-
-# Formatting
-uvx ruff format .
-
-# Linting
-uvx ruff check --fix --unsafe-fixes .
+uv run ruff check .
+uv run ruff format --check .
 ```
+
+Run them through `uv run` rather than `uvx`, which resolves a ruff version of its own
+and can disagree with CI.
 
 ## Security Notes
 
-- Use app passwords if 2FA is enabled
 - Consider using a dedicated Discord account for automation
-- Always use `DISCORD_HEADLESS=true` in production
+- Run `DISCORD_HEADLESS=true` in production; reserve `false` for reseeding the cookie
+- 2FA and device verification are cleared by the human at the headed reseed browser
 
 ## Troubleshooting
 
-- **Login issues**: Verify credentials, use app password for 2FA
+- **`CookieExpiredError`**: the cookie is missing or expired. Rerun with
+  `DISCORD_HEADLESS=false` and sign in at the visible browser (Quick Start step 1);
+  checking the credentials changes nothing, since the headless path never submits them
 - **Browser errors**: Run `uv run playwright install --force`
 - **Rate limits**: Reduce `max_messages`, monitor for Discord warnings
-- **Cookie issues**: Delete `~/.discord_mcp_cookies.json` if needed
+- **A tool call hangs or the session looks wrong**: delete
+  `~/.discord_mcp_cookies.json` and reseed headed
 
 ## Legal Notice
 

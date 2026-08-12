@@ -10,6 +10,8 @@ Tool definitions and module layout live in `src/discord_mcp/server.py`. The `dis
 
 A message's post time comes from its id, not from the row: Discord ids are snowflakes carrying milliseconds since 2015-01-01 in their high 42 bits (verified 2026-08-11 against 40 rendered rows — every one matched its `<time datetime>` exactly). A row cannot render without its id, so there is no timestamp-less row to date to now and no fallback to guess.
 
+`get_channel_threads` reads the sidebar's thread group for the channel it just navigated to and returns each thread as a `DiscordChannel`: a thread's id addresses it exactly like a channel, so `get_channel_messages` reads one unchanged. No MCP tool exposes it. A thread's messages never appear in the parent channel's feed, which shows only a "started a thread" marker, so `../bin/discord_messages.py` calls it per configured channel and reads each thread as its own feed — `#the-furious-five` carries its traffic in per-arc threads and reads as empty otherwise. The sidebar lists active (non-archived) threads only; the docstring carries that boundary.
+
 Paging accumulates *sightings* per message id, not finished messages: each pass re-extracts every rendered row, and what a row yields grows as history loads above it, so fields merge first-non-empty across passes. A row whose group start hadn't loaded yet gets its author from a later pass rather than relying on re-derivation. After each pass the accumulated set is re-read into messages; an id inside the window that still resolves to no author, or to no text and no attachment, is logged as a gap rather than dropped silently. The thread-opening banner is the one row that is no message — Discord gives it the thread's own id, and it is excluded before the window check because that id dates it to thread creation.
 
 ## Reliability
@@ -23,7 +25,7 @@ Paging accumulates *sightings* per message id, not finished messages: each pass 
 
 ## Development Workflow
 1. Make changes following functional programming patterns
-2. Verify types with `uv run pyright`
+2. Run what `.github/workflows/pr-checks.yml` gates a PR on, in its order: `uv run pyright`, `uv run ruff check .`, `uv run ruff format --check .`. `uv run` takes ruff from this project's pinned dev group; `uvx ruff` resolves its own version and can disagree with CI
 3. Verify the affected MCP tool(s) against live Discord — there is no test suite; drive the client path directly (e.g. `uv run --project . python -c ...` or via `../bin/discord_messages.py`)
 
 ## Configuration

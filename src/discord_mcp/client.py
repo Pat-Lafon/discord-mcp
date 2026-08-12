@@ -724,8 +724,8 @@ async def get_channel_threads(
 ) -> tuple[ClientState, list[DiscordChannel]]:
     """Discover a channel's active threads from Discord's own sidebar thread
     index (see `_THREAD_SCRAPE_JS`), read after navigating to the channel so it
-    is the selected one whose thread group is rendered. Unlike the old
-    feed-marker scrape, this finds a thread regardless of when it was created.
+    is the selected one whose thread group is rendered. A thread is found
+    regardless of when it was created.
 
     Boundary: the sidebar lists *active* (non-archived) threads only. A thread
     that had activity in the review window but has since auto-archived won't
