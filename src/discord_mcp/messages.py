@@ -32,4 +32,4 @@ async def read_recent_messages(
     recent = [m for m in window.messages if m.timestamp > since]
     logger.debug(f"Filtered to {len(recent)} messages after cutoff {since}")
 
-    return state, WindowRead(messages=recent, reached_since=window.reached_since)
+    return state, WindowRead(messages=recent, stop=window.stop)

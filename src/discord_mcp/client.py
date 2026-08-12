@@ -1,5 +1,6 @@
+import enum
 import pathlib as pl
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import dataclasses as dc
 from playwright.async_api import (
     Browser,
@@ -23,17 +24,34 @@ class DiscordMessage:
     attachments: list[str]
 
 
-@dc.dataclass(frozen=True)
-class WindowRead:
-    """A channel read plus whether paging confirmed it covered the window.
+class StopReason(enum.Enum):
+    """Which of paging's four exits it took — the caller's ground for trusting
+    the read covers the window it asked for.
 
-    `reached_since` is True only when a message older than `since` was seen, so
-    False with a non-empty read means the feed's history ended — or paging
-    stalled — inside the window, and the caller cannot tell which from here.
+    STALLED is the one that stays ambiguous: three passes surfacing no new row
+    is what a feed whose loaded history ends above the window looks like, and
+    also what a broken scroll gesture looks like. Every other exit is derived,
+    not inferred.
     """
 
+    WINDOW_EDGE = "window-edge"  # a message older than `since` was rendered
+    FEED_EXHAUSTED = "feed-exhausted"  # feed fits its viewport; nothing above it
+    LIMIT = "limit"  # `limit` reached with older messages still unread
+    STALLED = "stalled"  # three passes surfaced no new row
+
+    @property
+    def covers_window(self) -> bool:
+        """Whether the read reaches the window's start, so the caller may
+        advance a watermark past it."""
+        return self in (StopReason.WINDOW_EDGE, StopReason.FEED_EXHAUSTED)
+
+
+@dc.dataclass(frozen=True)
+class WindowRead:
+    """A channel read plus why paging stopped."""
+
     messages: list[DiscordMessage]
-    reached_since: bool
+    stop: StopReason
 
 
 # A thread is addressed exactly like a channel — same id space, same url shape,
@@ -237,12 +255,15 @@ async def close_client(state: ClientState) -> None:
         (state.playwright, "stop"),
     ]
 
+    # Teardown never fails the caller's read, which has already happened — but a
+    # resource that will not close leaks a browser per run, and that is only
+    # findable if it says so.
     for resource, action in resources:
         try:
             if resource:
                 await getattr(resource, action)()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"{action} on {type(resource).__name__} failed: {e}")
 
 
 async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild]]:
@@ -508,39 +529,71 @@ def _content(raw: dict) -> str:
 # exist without an id, where a missing datetime would date it to now and so
 # read as inside every window.
 _SNOWFLAKE_EPOCH_MS = 1420070400000
+_DISCORD_EPOCH = datetime.fromtimestamp(_SNOWFLAKE_EPOCH_MS / 1000, UTC)
 
 
 def _posted_at(message_id: str) -> datetime:
-    return datetime.fromtimestamp(
-        ((int(message_id) >> 22) + _SNOWFLAKE_EPOCH_MS) / 1000, UTC
-    )
+    since_epoch_ms = int(message_id) >> 22
+    posted = datetime.fromtimestamp((since_epoch_ms + _SNOWFLAKE_EPOCH_MS) / 1000, UTC)
+    # Two ways this can be a date rather than a post time, both of which would
+    # otherwise read as plausible and move the window boundary every caller
+    # reads. An id with no timestamp bits set is no snowflake — it decodes to
+    # the epoch instant itself, which reads as older than any window and would
+    # end paging on the spot. A decode landing outside Discord's lifetime means
+    # the shift or epoch below is wrong.
+    if since_epoch_ms <= 0 or not (
+        _DISCORD_EPOCH <= posted <= datetime.now(UTC) + timedelta(minutes=5)
+    ):
+        raise ValueError(
+            f"id {message_id} decodes to {posted.isoformat()}, which is no post"
+            " time; snowflake decoding is wrong or this id is not a message id"
+        )
+    return posted
+
+
+# Read whole, a row names its author and says something. Neither placeholder is
+# a value any Discord row produces, so a degraded row reads as degraded in the
+# report rather than as an ordinary message from a user named "".
+_UNKNOWN_AUTHOR = "(unknown author)"
+_UNREADABLE_CONTENT = "(row rendered but no text, attachment, poll or link was read)"
 
 
 @dc.dataclass(frozen=True)
 class _Obs:
-    """A row as the passes so far have managed to read it. Each field defaults
-    to empty and stays that way until some pass supplies it."""
+    """A row as the passes so far have read it.
 
-    author_name: str | None = None
-    content: str = ""
-    attachments: list[str] = dc.field(default_factory=list)
+    `content` and `attachments` belong to the row itself, so whichever pass last
+    rendered it read the whole story and simply overwrites. `author_name` is the
+    one field that grows across passes: Discord writes a name only on the first
+    row of a run, and that row may sit above what has loaded, so an early pass
+    can have no name to carry down where a later one does.
+    """
 
-    def complete(self) -> bool:
-        """Whether the sightings so far amount to a reportable message. Both
-        ways of falling short — no author resolved, or no text and no attachment
-        read — are answers a later pass can still change, so this is asked of
-        the accumulated set after each pass rather than of a row as it lands."""
-        return self.author_name is not None and bool(self.content or self.attachments)
+    author_name: str | None
+    content: str
+    attachments: list[str]
+
+    def degradation(self) -> str | None:
+        """What paging failed to read, or None for a row read whole. The two
+        want different fixes: no author means paging stopped below the row
+        naming that run, no content means the selectors missed text on the
+        page."""
+        if self.author_name is None:
+            return "no author"
+        if not self.content and not self.attachments:
+            return "no content"
+        return None
 
 
 def _message(message_id: str, obs: _Obs, channel_id: str) -> DiscordMessage:
-    """The message a complete `_Obs` amounts to; the assert is what narrows
-    `author_name` for the type checker."""
-    assert obs.author_name is not None
+    """The message a row amounts to. A row read only in part still reports —
+    standing in for what wasn't read — because a reader of the report is the
+    only one positioned to notice a gap, and a row withheld from them is a gap
+    nothing shows."""
     return DiscordMessage(
         id=message_id,
-        content=obs.content,
-        author_name=obs.author_name,
+        content=obs.content or ("" if obs.attachments else _UNREADABLE_CONTENT),
+        author_name=obs.author_name or _UNKNOWN_AUTHOR,
         channel_id=channel_id,
         timestamp=_posted_at(message_id),
         attachments=obs.attachments,
@@ -593,20 +646,27 @@ async def get_channel_messages(
     await page.wait_for_timeout(2000)
 
     seen: dict[str, _Obs] = {}
-    extract_errors = 0
     reached_since = False
     stalled_passes = 0
+    stop = StopReason.STALLED
 
     # Discord loads older history only when the feed's scroller reaches its top,
     # and each chunk prepends content that pushes the viewport back down, so the
     # scroller is jumped to 0 each pass. A keyboard PageUp moves one viewport
     # within already-rendered rows and loads nothing (measured 2026-07-30).
+    #
+    # The gesture reports which case it found, so a feed too short to scroll is
+    # told apart from one whose scroller this no longer finds — the first has no
+    # history left to load, the second loads none because it is broken.
     scroll_to_top = """
         () => {
           const list = document.querySelector('[data-list-id="chat-messages"]');
+          if (!list) return "no-list";
           let s = list;
           while (s && s.scrollHeight <= s.clientHeight + 1) s = s.parentElement;
-          if (s) s.scrollTo(0, 0);
+          if (!s) return "not-scrollable";
+          s.scrollTo(0, 0);
+          return "scrolled";
         }
     """
 
@@ -614,9 +674,20 @@ async def get_channel_messages(
     # the old end of any window needing more passes than the cap.
     while stalled_passes < 3:
         extracted = await page.evaluate(_EXTRACT_ROWS_JS)
+        # The per-row catch is there to tolerate one malformed row. Past that,
+        # the extractor is broken against a changed DOM, and the tell is a read
+        # that comes back short rather than empty — short reads as a quiet
+        # channel, which is the shape of an ordinary day here.
+        nulls = sum(row is None for row in extracted)
+        if nulls > max(1, len(extracted) // 10):
+            raise RuntimeError(
+                f"channel {channel_id}: {nulls} of {len(extracted)} rendered rows"
+                " failed to extract; message extractor is broken (likely a"
+                " Discord DOM change)"
+            )
         logger.debug(
-            f"pass: {len(extracted)} rows rendered, {len(seen)} unique so far,"
-            f" stalled={stalled_passes}"
+            f"pass: {len(extracted)} rows rendered ({nulls} unreadable),"
+            f" {len(seen)} unique so far, stalled={stalled_passes}"
         )
         known_before_pass = len(seen)
         # Oldest first: Discord omits the username header on a run of messages
@@ -625,10 +696,7 @@ async def get_channel_messages(
         # 2026-08-11) can be a run's only named one.
         carried: str | None = None
         for raw in extracted:
-            # A broken extractor (DOM change) nulls every row; the canary below
-            # turns that into a failure rather than an empty channel.
             if raw is None:
-                extract_errors += 1
                 continue
             author = raw["authorName"] or carried
             carried = author
@@ -641,53 +709,56 @@ async def get_channel_messages(
             # is covered — asked of every row, readable or not.
             if _posted_at(raw["id"]) < since:
                 reached_since = True
-            # Merge rather than overwrite or skip-if-known: a row is re-extracted
-            # every pass and yields more as history loads above it, so a later
-            # pass can supply an author an earlier one had no group start for.
-            prior = seen.get(raw["id"], _Obs())
+            # Only the author carries across passes; see `_Obs`. Overwriting the
+            # other two keeps an edit, or a component that mounted late, from
+            # being masked by the first thing this row was ever seen to say.
+            prior = seen.get(raw["id"])
             seen[raw["id"]] = _Obs(
-                author_name=author or prior.author_name,
-                content=_content(raw) or prior.content,
-                attachments=raw["attachments"] or prior.attachments,
+                author_name=author or (prior.author_name if prior else None),
+                content=_content(raw),
+                attachments=raw["attachments"],
             )
 
-        # Counted over the whole set: this pass may have completed a message
-        # first sighted several passes ago.
-        if reached_since or sum(o.complete() for o in seen.values()) >= limit:
+        if reached_since:
+            stop = StopReason.WINDOW_EDGE
+            break
+        if len(seen) >= limit:
+            stop = StopReason.LIMIT
             break
         stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
-        await page.evaluate(scroll_to_top)
+        scrolled = await page.evaluate(scroll_to_top)
+        if scrolled == "no-list":
+            raise RuntimeError(
+                f"channel {channel_id}: message list vanished mid-page; paging"
+                " is broken (failed load or Discord DOM change)"
+            )
+        if scrolled == "not-scrollable":
+            # Every row the feed has fits one viewport, so there is no older
+            # history to load and the read is whole, not merely stalled.
+            stop = StopReason.FEED_EXHAUSTED
+            break
         await page.wait_for_timeout(1000)
 
-    messages = [_message(i, o, channel_id) for i, o in seen.items() if o.complete()]
+    messages = [_message(i, o, channel_id) for i, o in seen.items()]
 
-    # An unreadable row inside the window is a gap in the record, named rather
-    # than dropped quietly. The two reasons want different fixes: no author means
-    # paging stopped below the row naming that run, no content means the
-    # selectors missed text that is on the page.
-    gaps = {
-        i: "no author" if o.author_name is None else "no content"
+    # A row read only in part still reports (see `_message`), so this names the
+    # rows to look at rather than deciding anything — the report already carries
+    # the gap to whoever reads it.
+    degraded = {
+        i: why
         for i, o in sorted(seen.items())
-        if not o.complete() and _posted_at(i) >= since
+        if (why := o.degradation()) and _posted_at(i) >= since
     }
-    if gaps:
+    if degraded:
         logger.warning(
-            f"channel {channel_id}: dropped {len(gaps)} unreadable row(s) in the"
-            f" window: {', '.join(f'{i} ({why})' for i, why in [*gaps.items()][:5])}"
-        )
-
-    # Rows were present but every extraction threw: the extractor is broken, not
-    # the channel empty.
-    if not messages and extract_errors:
-        raise RuntimeError(
-            f"channel {channel_id}: saw message rows but extracted 0 messages"
-            f" ({extract_errors} extraction errors); message extractor is broken"
-            " (likely a Discord DOM change)"
+            f"channel {channel_id}: {len(degraded)} row(s) in the window read"
+            " only in part, reported with a placeholder:"
+            f" {', '.join(f'{i} ({why})' for i, why in [*degraded.items()][:5])}"
         )
 
     return state, WindowRead(
         messages=sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit],
-        reached_since=reached_since,
+        stop=stop,
     )
 
 
