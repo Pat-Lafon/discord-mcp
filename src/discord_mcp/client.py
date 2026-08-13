@@ -115,7 +115,11 @@ def _require_page(state: ClientState) -> Page:
 # Login state, as positive signals. A timeout/error is Indeterminate — never
 # folded into LoggedOut, so a slow page load can't masquerade as a logged-out
 # session and force the fragile credential form when the cookies are still good.
-class LoginState: ...
+class LoginState:
+    # A probe is formatted into the error a headed reseed shows its human, so the
+    # field-less variants name themselves. Indeterminate's dataclass repr wins.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
 
 
 class LoggedIn(LoginState): ...
