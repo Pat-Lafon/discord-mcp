@@ -417,11 +417,11 @@ async def get_guild_channels(
 # it quotes in place of itself and hands that author to the continuations under
 # it.
 #
-# A row that throws comes back as null rather than losing the pass, so one
-# malformed row is tolerated while a DOM change that trips every row still
-# reaches the caller's canary.
+# A row that throws, or that names no author and says nothing, comes back as
+# null rather than losing the pass — one malformed row is tolerated while a DOM
+# change that trips every row still reaches the caller's canary.
 _EXTRACT_ROWS_JS = """
-() => {
+(channelId) => {
   const own = (el) => !el.closest('[class*="repliedMessage"]');
   // Discord renders every emoji as an <img> whose alt carries what was typed —
   // the character for a unicode emoji, `:name:` for a custom one — so
@@ -470,9 +470,14 @@ _EXTRACT_ROWS_JS = """
     };
   };
 
-  const rows = document.querySelectorAll(
-      '[data-list-id="chat-messages"] [id^="chat-messages-"]');
-  return [...rows].map((row) => {
+  // `chat-messages-{channelId}-{messageId}` — the trailing segment is the
+  // snowflake the caller dates the row from. A thread's opening banner is the
+  // one rendered row that is no message, and Discord gives it the thread's own
+  // id there; dropped here, since that id dates it to the thread's creation.
+  const rows = [...document.querySelectorAll(
+      '[data-list-id="chat-messages"] [id^="chat-messages-"]')]
+      .filter((row) => row.id.split('-').pop() !== channelId);
+  return rows.map((row) => {
     try {
       const contentEl = firstNode(row, '[class*="markup"]');
       // Discord marks a forward with a quote spine sitting *beside* the
@@ -489,18 +494,40 @@ _EXTRACT_ROWS_JS = """
       // them here keeps such a row from reporting its file twice.
       const link = [...row.querySelectorAll(
           'a[href^="http"]:not([href*="cdn.discordapp.com"])')].find(own);
+      // Discord writes a username node only on the first row of a run, but
+      // every continuation labels itself with that row's username node by id,
+      // so authorship is read from the row rather than inferred from the
+      // nearest name above it. Measured 2026-08-12 over 104 continuation rows:
+      // every one carried a `message-username-*` idref and every idref
+      // resolved, including across a pass where virtualization evicted 50 rows
+      // — Discord evicts whole groups, so a continuation is never rendered
+      // without its head. A reply row labels its article with the message it
+      // quotes, so the prefix is matched rather than the first idref taken.
+      const usernameRef = [...row.querySelectorAll('[aria-labelledby]')]
+          .flatMap((el) => (el.getAttribute('aria-labelledby') || '').split(' '))
+          .find((ref) => ref.startsWith('message-username-'));
+      const named = usernameRef ? document.getElementById(usernameRef) : null;
+      const authorName =
+          textOf(row, '[class*="username"]') || (named ? readText(named) : "");
+      const poll = pollOf(row);
+      const content = contentEl ? readText(contentEl) : "";
+      const attachments = [...row.querySelectorAll(
+          'a[href*="cdn.discordapp.com"]')].filter(own)
+          .map((a) => a.getAttribute('href'));
+      // A row names someone and says something. Neither failed once across the
+      // 250 rows of these feeds measured 2026-08-12, so a row that reads as
+      // neither is a selector that stopped matching rather than a kind of row
+      // — it joins the malformed ones the caller's canary counts.
+      if (!authorName) return null;
+      if (!content && !poll && !link && !attachments.length) return null;
       return {
-        // `chat-messages-{channelId}-{messageId}` — the trailing segment is the
-        // snowflake the caller dates the row from. A thread's opening banner
-        // carries the thread's own id there instead of a message's.
         id: row.id.split('-').pop(),
-        authorName: textOf(row, '[class*="username"]') || null,
-        content: contentEl ? readText(contentEl) : "",
+        authorName: authorName,
+        content: content,
         forwarded: forwarded,
-        poll: pollOf(row),
+        poll: poll,
         link: link ? link.getAttribute('href') : null,
-        attachments: [...row.querySelectorAll('a[href*="cdn.discordapp.com"]')]
-            .filter(own).map(a => a.getAttribute('href')),
+        attachments: attachments,
       };
     } catch (e) {
       return null;
@@ -555,52 +582,16 @@ def _posted_at(message_id: str) -> datetime:
     return posted
 
 
-# Read whole, a row names its author and says something. Neither placeholder is
-# a value any Discord row produces, so a degraded row reads as degraded in the
-# report rather than as an ordinary message from a user named "".
-_UNKNOWN_AUTHOR = "(unknown author)"
-_UNREADABLE_CONTENT = "(row rendered but no text, attachment, poll or link was read)"
-
-
-@dc.dataclass(frozen=True)
-class _Obs:
-    """A row as the passes so far have read it.
-
-    `content` and `attachments` belong to the row itself, so whichever pass last
-    rendered it read the whole story and simply overwrites. `author_name` is the
-    one field that grows across passes: Discord writes a name only on the first
-    row of a run, and that row may sit above what has loaded, so an early pass
-    can have no name to carry down where a later one does.
-    """
-
-    author_name: str | None
-    content: str
-    attachments: list[str]
-
-    def degradation(self) -> str | None:
-        """What paging failed to read, or None for a row read whole. The two
-        want different fixes: no author means paging stopped below the row
-        naming that run, no content means the selectors missed text on the
-        page."""
-        if self.author_name is None:
-            return "no author"
-        if not self.content and not self.attachments:
-            return "no content"
-        return None
-
-
-def _message(message_id: str, obs: _Obs, channel_id: str) -> DiscordMessage:
-    """The message a row amounts to. A row read only in part still reports —
-    standing in for what wasn't read — because a reader of the report is the
-    only one positioned to notice a gap, and a row withheld from them is a gap
-    nothing shows."""
+def _message(raw: dict, channel_id: str) -> DiscordMessage:
+    """The message a row amounts to. Every field is the row's own, so the
+    extraction a pass returns is the whole message."""
     return DiscordMessage(
-        id=message_id,
-        content=obs.content or ("" if obs.attachments else _UNREADABLE_CONTENT),
-        author_name=obs.author_name or _UNKNOWN_AUTHOR,
+        id=raw["id"],
+        content=_content(raw),
+        author_name=raw["authorName"],
         channel_id=channel_id,
-        timestamp=_posted_at(message_id),
-        attachments=obs.attachments,
+        timestamp=_posted_at(raw["id"]),
+        attachments=raw["attachments"],
     )
 
 
@@ -649,7 +640,7 @@ async def get_channel_messages(
     """)
     await page.wait_for_timeout(2000)
 
-    seen: dict[str, _Obs] = {}
+    seen: dict[str, dict] = {}
     reached_since = False
     stalled_passes = 0
     stop = StopReason.STALLED
@@ -677,7 +668,7 @@ async def get_channel_messages(
     # Bounded by progress, not a fixed pass count, which would silently truncate
     # the old end of any window needing more passes than the cap.
     while stalled_passes < 3:
-        extracted = await page.evaluate(_EXTRACT_ROWS_JS)
+        extracted = await page.evaluate(_EXTRACT_ROWS_JS, channel_id)
         # The per-row catch is there to tolerate one malformed row. Past that,
         # the extractor is broken against a changed DOM, and the tell is a read
         # that comes back short rather than empty — short reads as a quiet
@@ -694,34 +685,18 @@ async def get_channel_messages(
             f" {len(seen)} unique so far, stalled={stalled_passes}"
         )
         known_before_pass = len(seen)
-        # Oldest first: Discord omits the username header on a run of messages
-        # from one author, so an unnamed row takes the nearest name above it.
-        # Carried over rendered rows, since an unreadable row (a poll, measured
-        # 2026-08-11) can be a run's only named one.
-        carried: str | None = None
         for raw in extracted:
             if raw is None:
                 continue
-            author = raw["authorName"] or carried
-            carried = author
-            # A thread's opening banner is the one rendered row that is no
-            # message; Discord gives it the thread's own id. Dropped before the
-            # window check, since that id dates it to the thread's creation.
-            if raw["id"] == channel_id:
-                continue
             # Rows walk backward in time, so one past the edge means the window
-            # is covered — asked of every row, readable or not.
+            # is covered.
             if _posted_at(raw["id"]) < since:
                 reached_since = True
-            # Only the author carries across passes; see `_Obs`. Overwriting the
-            # other two keeps an edit, or a component that mounted late, from
-            # being masked by the first thing this row was ever seen to say.
-            prior = seen.get(raw["id"])
-            seen[raw["id"]] = _Obs(
-                author_name=author or (prior.author_name if prior else None),
-                content=_content(raw),
-                attachments=raw["attachments"],
-            )
+            # Every field belongs to the row itself, so whichever pass last
+            # rendered it read the whole story and simply overwrites — an edit,
+            # or a component that mounted late, is not masked by the first
+            # thing this row was ever seen to say.
+            seen[raw["id"]] = raw
 
         if reached_since:
             stop = StopReason.WINDOW_EDGE
@@ -743,22 +718,7 @@ async def get_channel_messages(
             break
         await page.wait_for_timeout(1000)
 
-    messages = [_message(i, o, channel_id) for i, o in seen.items()]
-
-    # A row read only in part still reports (see `_message`), so this names the
-    # rows to look at rather than deciding anything — the report already carries
-    # the gap to whoever reads it.
-    degraded = {
-        i: why
-        for i, o in sorted(seen.items())
-        if (why := o.degradation()) and _posted_at(i) >= since
-    }
-    if degraded:
-        logger.warning(
-            f"channel {channel_id}: {len(degraded)} row(s) in the window read"
-            " only in part, reported with a placeholder:"
-            f" {', '.join(f'{i} ({why})' for i, why in [*degraded.items()][:5])}"
-        )
+    messages = [_message(raw, channel_id) for raw in seen.values()]
 
     return state, WindowRead(
         messages=sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit],
