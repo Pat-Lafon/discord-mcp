@@ -25,7 +25,7 @@ class DiscordMessage:
 
 
 class StopReason(enum.Enum):
-    """Which of paging's four exits it took — the caller's ground for trusting
+    """Which of paging's three exits it took — the caller's ground for trusting
     the read covers the window it asked for.
 
     STALLED is the one that stays ambiguous: three passes surfacing no new row
@@ -36,7 +36,6 @@ class StopReason(enum.Enum):
 
     WINDOW_EDGE = "window-edge"  # a message older than `since` was rendered
     FEED_EXHAUSTED = "feed-exhausted"  # feed fits its viewport; nothing above it
-    LIMIT = "limit"  # `limit` reached with older messages still unread
     STALLED = "stalled"  # three passes surfaced no new row
 
     @property
@@ -621,14 +620,14 @@ async def get_channel_messages(
     server_id: str,
     channel_id: str,
     since: datetime,
-    limit: int = 100,
 ) -> tuple[ClientState, WindowRead]:
     """Read a channel's (or thread's) messages back to `since`, newest first.
 
-    `since` bounds the paging itself, not just the result: one message older
-    than the window ends the loop, so a quiet channel costs one pass. `limit`
-    caps what comes back and stops paging early, standing in for the window on
-    a feed busy enough to make covering it unaffordable.
+    `since` is the only bound on the read: one message older than the window
+    ends the loop, so a quiet channel costs one pass and a busy one pays for
+    every message its caller asked to see. A row cap would buy wall-clock by
+    cutting the *oldest* rows read — the ones nearest `since`, which a watermark
+    caller never revisits.
     """
     state, page = await _open_channel(state, server_id, channel_id)
 
@@ -701,9 +700,6 @@ async def get_channel_messages(
         if reached_since:
             stop = StopReason.WINDOW_EDGE
             break
-        if len(seen) >= limit:
-            stop = StopReason.LIMIT
-            break
         stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
         scrolled = await page.evaluate(scroll_to_top)
         if scrolled == "no-list":
@@ -721,7 +717,7 @@ async def get_channel_messages(
     messages = [_message(raw, channel_id) for raw in seen.values()]
 
     return state, WindowRead(
-        messages=sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit],
+        messages=sorted(messages, key=lambda m: m.timestamp, reverse=True),
         stop=stop,
     )
 

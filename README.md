@@ -37,8 +37,8 @@ Repeat step 1 whenever the cookie expires.
 # List your Discord servers
 > use get_servers to show me all my Discord servers
 
-# Read recent messages (max_messages is required)
-> read the last 20 messages from channel ID 123 in server ID 456
+# Read recent messages
+> read the last day of messages from channel ID 123 in server ID 456
 
 # Monitor communities
 > summarize discussions from the last 24 hours across my Discord servers
@@ -48,7 +48,7 @@ Repeat step 1 whenever the cookie expires.
 
 - **`get_servers`** - List all Discord servers you have access to
 - **`get_channels(server_id)`** - List channels in a specific server
-- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages (newest first, max_messages required)
+- **`read_messages(server_id, channel_id, hours_back?)`** - Read every message posted in the last `hours_back` hours (newest first)
 
 ## Manual Setup
 
@@ -128,7 +128,7 @@ and can disagree with CI.
   `DISCORD_HEADLESS=false` and sign in at the visible browser (Quick Start step 1);
   checking the credentials changes nothing, since the headless path never submits them
 - **Browser errors**: Run `uv run playwright install --force`
-- **Rate limits**: Reduce `max_messages`, monitor for Discord warnings
+- **Rate limits**: Reduce `hours_back`, monitor for Discord warnings
 - **A tool call hangs or the session looks wrong**: delete
   `~/.discord_mcp_cookies.json` and reseed headed
 
