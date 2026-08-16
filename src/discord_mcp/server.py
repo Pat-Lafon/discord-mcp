@@ -44,7 +44,7 @@ async def _execute_with_persistent_client[T](
     discord_ctx: DiscordContext,
     operation: Callable[[ClientState], tp.Awaitable[tuple[ClientState, T]]],
 ) -> T:
-    """Execute Discord operation with a persistent client, retrying once on Playwright errors."""
+    """Execute Discord operation with a persistent client, retrying once on Playwright or transient-login errors."""
     cfg = discord_ctx.config
     async with discord_ctx.client_lock:
         state = discord_ctx.client_state
