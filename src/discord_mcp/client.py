@@ -1,3 +1,4 @@
+import asyncio
 import enum
 import pathlib as pl
 from datetime import UTC, datetime, timedelta
@@ -69,8 +70,6 @@ class DiscordGuild:
 
 @dc.dataclass(frozen=True)
 class ClientState:
-    email: str
-    password: str
     headless: bool = True
     playwright: Playwright | None = None
     browser: Browser | None = None
@@ -113,9 +112,9 @@ def _require_page(state: ClientState) -> Page:
 
 # Login state, as positive signals. A timeout/error is Indeterminate — never
 # folded into LoggedOut, so a slow page load can't masquerade as a logged-out
-# session and force the fragile credential form when the cookies are still good.
+# session and send a working cookie off to be reseeded by hand.
 class LoginState:
-    # A probe is formatted into the error a headed reseed shows its human, so the
+    # A probe is formatted into the error a reseed shows its human, so the
     # field-less variants name themselves. Indeterminate's dataclass repr wins.
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
@@ -141,9 +140,9 @@ class TransientLoginError(DiscordLoginError):
 
 
 class CookieExpiredError(DiscordLoginError):
-    """The persisted session is gone. The headless job won't relogin — a fresh
-    login trips Discord's device verification with no human to clear it — so this
-    surfaces for a headed reseed instead."""
+    """The persisted session is gone. Nothing here logs in — Discord's device
+    verification, 2FA and CAPTCHA all expect a person — so this surfaces for a
+    manual reseed instead."""
 
 
 def _is_auth_url(url: str) -> bool:
@@ -186,39 +185,46 @@ async def _probe_login_state(
     return LoggedIn()
 
 
-_EMAIL_FIELD = 'input[name="email"]'
+async def reseed_cookie(state: ClientState) -> ClientState:
+    """Open a visible browser at Discord's login page and persist the session a
+    human signs in with. The only writer of the cookie file.
 
-
-async def _perform_credential_login(state: ClientState) -> ClientState:
-    page = _require_page(state)
-
-    # The fatal DiscordLoginError (a Discord DOM change) isn't a PlaywrightError,
-    # so it escapes this handler; any raw Playwright failure in the
-    # goto/fill/click/wait path is a transient stall, not a structural block.
-    try:
-        await page.goto("https://discord.com/login")
-        try:
-            await page.wait_for_selector(_EMAIL_FIELD, state="visible", timeout=45000)
-        except PlaywrightTimeoutError:
-            raise DiscordLoginError("login form did not appear") from None
-
-        await page.fill(_EMAIL_FIELD, state.email)
-        await page.fill('input[name="password"]', state.password)
-        await page.click('button[type="submit"]')
-
-        await page.wait_for_function(
-            "() => !window.location.href.includes('/login')", timeout=60000
+    Authentication is the human's whole job here: device verification, 2FA and
+    CAPTCHA each expect a person, and driving the login form around them means
+    tracking Discord's markup for a path that runs about once a quarter. So this
+    waits on stdin rather than on any selector, and reads the result through the
+    same guild-nav probe every other caller trusts.
+    """
+    if state.headless:
+        raise ValueError(
+            "reseed needs a visible browser: build the state headless=False"
         )
-    except PlaywrightError as e:
-        raise TransientLoginError(f"login did not complete: {e}") from e
 
-    probe = await _probe_login_state(state, guild_nav_timeout_ms=30000)
+    state = await _ensure_browser(state)
+    page = _require_page(state)
+    # domcontentloaded, as everywhere else here: Discord's `load` waits on the
+    # whole SPA. The 120s bound is for this path alone — a cold headed window
+    # measured 31s against headless's 10s on 2026-08-15, and the default 30s
+    # timed out on a reseed nobody would know how to read as "too slow".
+    await page.goto(
+        "https://discord.com/login", wait_until="domcontentloaded", timeout=120000
+    )
+
+    # input() off the event loop: the browser is a live subprocess this coroutine
+    # still owns, and blocking here stops answering it.
+    await asyncio.get_running_loop().run_in_executor(
+        None, input, "Sign in at the browser window, then press Enter here: "
+    )
+
+    # Confirm before writing: an Enter pressed early would otherwise persist a
+    # logged-out state over the cookie that was working.
+    probe = await _probe_login_state(state)
     if not isinstance(probe, LoggedIn):
-        raise TransientLoginError(f"login submitted but state unconfirmed: {probe}")
+        raise DiscordLoginError(f"not signed in ({probe}); cookie file left alone")
 
-    state = dc.replace(state, logged_in=True)
     await _save_storage_state(state)
-    return state
+    logger.info(f"session saved to {state.cookies_file}")
+    return dc.replace(state, logged_in=True)
 
 
 async def _login(state: ClientState) -> ClientState:
@@ -228,7 +234,7 @@ async def _login(state: ClientState) -> ClientState:
     state = await _ensure_browser(state)
 
     # An indeterminate probe (slow load) re-probes with a longer wait rather than
-    # diving into the credential form, whose email field would just time out too.
+    # calling the cookie dead, which would send a working session to reseed.
     probe = await _probe_login_state(state)
     if isinstance(probe, Indeterminate):
         logger.debug(f"login state indeterminate ({probe.reason}); re-probing")
@@ -239,14 +245,10 @@ async def _login(state: ClientState) -> ClientState:
     if isinstance(probe, Indeterminate):
         raise TransientLoginError(probe.reason)
 
-    # LoggedOut: the cookie is dead. Only a headed run reseeds it (see
-    # CookieExpiredError); the headless job surfaces the prompt instead.
-    if state.headless:
-        raise CookieExpiredError(
-            "Discord session cookie is expired or missing; rerun headed"
-            " (DISCORD_HEADLESS=false) to log in and reseed it"
-        )
-    return await _perform_credential_login(state)
+    raise CookieExpiredError(
+        "Discord session cookie is expired or missing; reseed it by running"
+        " `discord-mcp-reseed` and signing in at the browser it opens"
+    )
 
 
 async def close_client(state: ClientState) -> None:
@@ -364,44 +366,10 @@ async def get_guild_channels(
     )
     await page.wait_for_timeout(3000)
 
-    logger.debug("Getting original channels")
-    original_channels = await page.evaluate(_EXTRACT_CHANNELS_JS, guild_id)
-    logger.debug(f"Found {len(original_channels)} original channels")
+    channels = await page.evaluate(_EXTRACT_CHANNELS_JS, guild_id)
+    logger.debug(f"Found {len(channels)} channels in guild {guild_id}")
 
-    # The initial sidebar scrape can miss channels; opening Browse Channels
-    # surfaces the rest, deduped against the first set below.
-    browse_channels = []
-    try:
-        browse_element = await page.query_selector('*:has-text("Browse Channels")')
-        if browse_element and await browse_element.is_visible():
-            await browse_element.click()
-            await page.wait_for_timeout(5000)
-            logger.debug("Clicked Browse Channels")
-
-            # Scroll all scrollable elements to load hidden channels
-            await page.evaluate("""
-                Array.from(document.querySelectorAll('*'))
-                    .filter(el => el.scrollHeight > el.clientHeight + 5)
-                    .forEach(el => el.scrollTop = el.scrollHeight)
-            """)
-            await page.wait_for_timeout(3000)
-
-            browse_channels = await page.evaluate(_EXTRACT_CHANNELS_JS, guild_id)
-            logger.debug(f"Found {len(browse_channels)} browse channels")
-    except Exception as e:
-        # Enrichment, so a failure still returns the sidebar's channels — but at
-        # warning level, or a Browse Channels that quietly stops working shows
-        # up only as channels missing from the result.
-        logger.warning(f"Browse Channels failed: {e}")
-
-    by_id: dict[str, dict] = {}
-    for ch in [*original_channels, *browse_channels]:
-        by_id.setdefault(ch["id"], ch)
-    logger.debug(f"Total unique channels: {len(by_id)}")
-
-    return state, [
-        DiscordChannel(id=ch["id"], name=ch["name"]) for ch in by_id.values()
-    ]
+    return state, [DiscordChannel(id=ch["id"], name=ch["name"]) for ch in channels]
 
 
 # Every rendered row, read in one pass over the document: per-row would be a
@@ -728,6 +696,13 @@ async def get_channel_messages(
 # creation markers in the message feed. We match the group by that label rather
 # than walking up from the channel row, because the row's nearest <li> excludes
 # the group; the label scopes to this channel even with several expanded.
+#
+# A row's label reads "{name} ({type})" with any state appended after it, comma
+# separated — "the-furious-five (text channel), Private Channel (locked)",
+# "Philbertia-Voice (voice channel), unread" (measured 2026-08-15 over 27 rows).
+# So a name is everything before the first " (", and membership in the group is
+# what makes a row a thread: a label suffix would stop matching the moment the
+# thread had unread messages, which is the only time its rows are worth reading.
 _THREAD_SCRAPE_JS = r"""
     (channelId) => {
         const parent = document.querySelector(
@@ -737,12 +712,10 @@ _THREAD_SCRAPE_JS = r"""
             `ul[role="group"][aria-label="${name} threads"]`);
         if (!grp) return [];  // no group -> channel has no active threads
         const out = [];
-        for (const el of grp.querySelectorAll(
-                '[data-list-item-id^="channels___"][aria-label$="(thread)"]')) {
+        for (const el of grp.querySelectorAll('[data-list-item-id^="channels___"]')) {
             out.push({
                 id: el.getAttribute('data-list-item-id').replace('channels___', ''),
-                name: (el.getAttribute('aria-label') || '')
-                    .replace(/\s*\(thread\)$/, '').trim(),
+                name: (el.getAttribute('aria-label') || '').split(' (')[0].trim(),
             });
         }
         return out;

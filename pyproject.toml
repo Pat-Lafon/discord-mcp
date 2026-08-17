@@ -10,12 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     "playwright>=1.52.0",
     "mcp>=1.9.3",
-    "python-dotenv>=1.1.0",
     "typing-extensions>=4.14.0",
 ]
 
 [project.scripts]
 discord-mcp = "discord_mcp:main"
+discord-mcp-reseed = "discord_mcp:reseed_main"
 
 [tool.ruff]
 line-length = 88

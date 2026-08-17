@@ -15,23 +15,20 @@ from .client import (
     close_client,
     TransientLoginError,
 )
-from .config import load_config
 from .messages import read_recent_messages
 
 
 @dataclass
 class DiscordContext:
-    config: tp.Any
     client_lock: asyncio.Lock
     client_state: ClientState | None = None
 
 
 @asynccontextmanager
 async def discord_lifespan(server: FastMCP) -> AsyncIterator[DiscordContext]:
-    config = load_config()
     client_lock = asyncio.Lock()
     logger.debug("Discord MCP server starting up")
-    ctx = DiscordContext(config=config, client_lock=client_lock)
+    ctx = DiscordContext(client_lock=client_lock)
     try:
         yield ctx
     finally:
@@ -45,7 +42,6 @@ async def _execute_with_persistent_client[T](
     operation: Callable[[ClientState], tp.Awaitable[tuple[ClientState, T]]],
 ) -> T:
     """Execute Discord operation with a persistent client, retrying once on Playwright or transient-login errors."""
-    cfg = discord_ctx.config
     async with discord_ctx.client_lock:
         state = discord_ctx.client_state
         if state is not None:
@@ -59,7 +55,7 @@ async def _execute_with_persistent_client[T](
         retried = False
         while True:
             if state is None:
-                state = ClientState(cfg.email, cfg.password, cfg.headless)
+                state = ClientState()
             try:
                 state, result = await operation(state)
                 discord_ctx.client_state = state
