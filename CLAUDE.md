@@ -27,6 +27,7 @@ Null rows in the extractor tolerate *one* bad row, so a pass where more than tha
 ## Reliability
 - One browser reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its page is closed or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an async lock serializes tool calls against the shared state
 - Cookie persistence at `~/.discord_mcp_cookies.json` for login state
+- `_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare 30s default is what failed on 3 of the 22 daily runs to 2026-08-16 (2026-07-20, 07-27, 08-16), each aborting the run mid-feed; measured navigation is 16s cold and 4-7s warm, and a `wait_for_selector` timeout has never been seen — the retry that existed covered only the step that does not fail
 
 ## Login (cookie-only, always)
 - `_login` probes the session, never trusting a timeout: a slow load is `Indeterminate` (re-probed once with a longer wait, then raised as `TransientLoginError` so the caller retries), never folded into `LoggedOut`. Only a positive guild-nav render is `LoggedIn`. The re-probe earns its place — 7 of the 21 daily runs to 2026-08-15 took it.

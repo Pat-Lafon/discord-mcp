@@ -271,61 +271,74 @@ async def close_client(state: ClientState) -> None:
             logger.warning(f"{action} on {type(resource).__name__} failed: {e}")
 
 
+# A guild row is a rail treeitem whose id suffix is the guild's snowflake — the
+# numeric test is what drops the rail's own chrome (`home`, `create-join-button`,
+# `guild-discover-button`, `app-download-button`). querySelectorAll sees every
+# guild regardless of scroll.
+_EXTRACT_GUILDS_JS = r"""
+    () => {
+        const guilds = [];
+        const seen = new Set();
+        const rows = document.querySelectorAll('[data-list-id="guildsnav"] [role="treeitem"]');
+        for (const item of rows) {
+            const id = item.getAttribute('data-list-item-id')?.replace('guildsnav___', '');
+            if (!id || !/^[0-9]+$/.test(id) || seen.has(id)) continue;
+            // A guild row renders as an icon, so its name is the one thing on it
+            // written for screen readers. Read that accessible name — the row's
+            // text minus every aria-hidden subtree — rather than plain textContent:
+            // a guild with no uploaded icon renders its acronym in an aria-hidden
+            // node, which textContent joined to the name as "Wrath and Glory 40kWaG4"
+            // (measured 2026-08-16, once aria-label had gone from these rows).
+            const named = item.cloneNode(true);
+            for (const hidden of named.querySelectorAll('[aria-hidden="true"]')) hidden.remove();
+            // The unread badge is spelled into that name and takes either end:
+            // "Unread messages, Dungeons of Purdue" and "Lets *Actually* Kill The
+            // Devil , 2 unread messages" (measured 2026-08-11 over 10 guilds). Left
+            // in, it becomes part of the name and changes as messages arrive.
+            const name = named.textContent
+                .replace(/^unread messages,\s*/i, '')
+                .replace(/^\d+\s+(mentions?|notifications?|unread),?\s*/i, '')
+                .replace(/\s*,\s*\d+\s+unread\s+messages?$/i, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (name) {
+                seen.add(id);
+                guilds.push({ id, name });
+            }
+        }
+        return guilds;
+    }
+"""
+
+
 async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild]]:
     state = await _login(state)
     page = _require_page(state)
 
     await page.goto("https://discord.com/channels/@me", wait_until="domcontentloaded")
 
-    # The guild rail loads in one jump *after* the non-guild chrome renders, so
-    # waiting on a treeitem fires too early and extracts nothing — poll instead,
-    # accepting the result once the guild count is positive and stops changing.
-    # querySelectorAll sees every guild regardless of scroll.
-    extract = """
-        () => {
-            const guilds = [];
-            const seen = new Set();
-            const rows = document.querySelectorAll('[data-list-id="guildsnav"] [role="treeitem"]');
-            for (const item of rows) {
-                const id = item.getAttribute('data-list-item-id')?.replace('guildsnav___', '');
-                if (!id || !/^[0-9]+$/.test(id) || seen.has(id)) continue;
-                // A guild row renders as an icon, so its only text is the label
-                // written for screen readers — the name with any unread badge
-                // spelled into it. Measured 2026-08-11 over 10 guilds, the badge
-                // takes either end: "Unread messages, Dungeons of Purdue" and
-                // "Lets *Actually* Kill The Devil , 2 unread messages". Left in,
-                // it becomes part of the name and changes as messages arrive.
-                const name = (item.getAttribute('aria-label') || item.textContent || '')
-                    .replace(/^unread messages,\\s*/i, '')
-                    .replace(/^\\d+\\s+(mentions?|notifications?|unread),?\\s*/i, '')
-                    .replace(/\\s*,\\s*\\d+\\s+unread\\s+messages?$/i, '')
-                    .replace(/\\s+/g, ' ')
-                    .trim();
-                if (name) {
-                    seen.add(id);
-                    guilds.push({ id, name });
-                }
-            }
-            return guilds;
-        }
-    """
-    prev = None
-    for _ in range(25):  # ~15s ceiling at 600ms/poll
-        guilds_data = await page.evaluate(extract)
-        if guilds_data and len(guilds_data) == prev:
-            return state, [
-                DiscordGuild(id=g["id"], name=g["name"]) for g in guilds_data
-            ]
-        prev = len(guilds_data)
-        await page.wait_for_timeout(600)
+    # The rail's chrome renders about half a second ahead of the guilds, which
+    # arrive with the gateway's READY payload, so waiting on `[role="treeitem"]`
+    # returns a rail holding no guild at all. Waiting on the extractor's own output
+    # is what makes the wait mean "the guilds are here". One payload renders in one
+    # commit, so there is no partial rail to catch: measured 2026-08-16, the count
+    # steps straight from 0 to all 9 on every navigation, including under a 20x CPU
+    # throttle that stretched the wait to 78s.
+    try:
+        await page.wait_for_function(
+            f"() => ({_EXTRACT_GUILDS_JS})().length > 0", timeout=30000
+        )
+    except PlaywrightTimeoutError as e:
+        # A logged-in account is in at least one guild, so an empty rail is a failed
+        # render or a Discord DOM change. Returning zero guilds would read as "you
+        # belong to none" and be believed.
+        raise RuntimeError(
+            "no guild rendered in the guild rail within 30s;"
+            " guild extractor is broken (likely a Discord DOM change)"
+        ) from e
 
-    # A logged-in account is in at least one guild, so a rail that never settles
-    # on a positive count is a failed render or a Discord DOM change. Reporting
-    # zero guilds would read as "you belong to none" and be believed.
-    raise RuntimeError(
-        f"guild rail never settled ({prev} guild(s) on the last of 25 polls);"
-        " guild extractor is broken (likely a Discord DOM change)"
-    )
+    guilds_data = await page.evaluate(_EXTRACT_GUILDS_JS)
+    return state, [DiscordGuild(id=g["id"], name=g["name"]) for g in guilds_data]
 
 
 # Channel rows are read from their sidebar links: a `/channels/{guild}/{channel}`
@@ -566,20 +579,24 @@ async def _open_channel(
     state: ClientState, server_id: str, channel_id: str
 ) -> tuple[ClientState, Page]:
     """Navigate to a channel (or thread — a thread is addressed like a channel)
-    and wait for its message list. Headless renders are flaky: the chat list
-    usually appears in ~2s but sometimes stalls indefinitely, so wait generously
-    and reload once before giving up."""
+    and wait for its message list. Both steps are flaky, so both get the same
+    generous bound and one retry: the chat list usually appears in ~2s but
+    sometimes stalls indefinitely, and the navigation itself is what timed out on
+    3 of the 22 daily runs to 2026-08-16 — the bare 30s default against a 16s
+    cold start. Re-navigating rather than reloading is what recovers a `goto`
+    that left the page nowhere."""
     state = await _login(state)
     page = _require_page(state)
-    await page.goto(
-        f"https://discord.com/channels/{server_id}/{channel_id}",
-        wait_until="domcontentloaded",
-    )
+    url = f"https://discord.com/channels/{server_id}/{channel_id}"
+
+    async def open_once() -> None:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=60000)
+
     try:
-        await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=60000)
+        await open_once()
     except PlaywrightTimeoutError:
-        await page.reload(wait_until="domcontentloaded")
-        await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=60000)
+        await open_once()
     return state, page
 
 
