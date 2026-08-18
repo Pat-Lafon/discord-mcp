@@ -647,17 +647,10 @@ async def get_channel_messages(
         }
     """
 
-    # Exhaustion is a fact about content, so it is read from the one row that
-    # states it: a feed's opening banner — "Welcome to #channel!", or a thread's
-    # starter — which Discord gives the feed's own id in the
-    # `chat-messages-{feed}-{row}` slot, and which the extractor drops for that
-    # reason. Rendered, nothing older exists. Geometry answers a different
-    # question and cannot stand in: a loaded feed taller than its pane scrolls
-    # exactly like a stalled one, which is every feed here — measured
-    # 2026-08-16, `#ravos` brought its first message into view on pass 6 of 9
-    # with the scroller still reporting scrollable, then paged three more times
-    # to conclude it had stalled. Probed by id because Discord's class names are
-    # content-hashed and churn.
+    # The opening banner carries the feed's own id (the row the extractor drops
+    # below), so its presence says nothing older exists. Geometry cannot stand in
+    # for that: a loaded feed taller than its pane scrolls exactly like a stalled
+    # one, which is every feed here. By id, since class names are hashed.
     at_beginning = """
         (channelId) => !!document.getElementById(
             `chat-messages-${channelId}-${channelId}`)
@@ -700,8 +693,6 @@ async def get_channel_messages(
             stop = StopReason.WINDOW_EDGE
             break
         if await page.evaluate(at_beginning, channel_id):
-            # The feed's first message is rendered, so `seen` already holds the
-            # whole feed and the window's start is above anything that exists.
             stop = StopReason.FEED_EXHAUSTED
             break
         stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
