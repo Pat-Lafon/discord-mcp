@@ -29,14 +29,13 @@ class StopReason(enum.Enum):
     """Which of paging's three exits it took — the caller's ground for trusting
     the read covers the window it asked for.
 
-    STALLED is the one that stays ambiguous: three passes surfacing no new row
-    is what a feed whose loaded history ends above the window looks like, and
-    also what a broken scroll gesture looks like. Every other exit is derived,
-    not inferred.
+    Each is derived from something the feed rendered, so STALLED is left holding
+    only the case where paging stopped and the feed never said why: Discord
+    served no more history and no beginning came into view.
     """
 
     WINDOW_EDGE = "window-edge"  # a message older than `since` was rendered
-    FEED_EXHAUSTED = "feed-exhausted"  # feed fits its viewport; nothing above it
+    FEED_EXHAUSTED = "feed-exhausted"  # the feed's opening banner was rendered
     STALLED = "stalled"  # three passes surfaced no new row
 
     @property
@@ -634,9 +633,8 @@ async def get_channel_messages(
     # scroller is jumped to 0 each pass. A keyboard PageUp moves one viewport
     # within already-rendered rows and loads nothing (measured 2026-07-30).
     #
-    # The gesture reports which case it found, so a feed too short to scroll is
-    # told apart from one whose scroller this no longer finds — the first has no
-    # history left to load, the second loads none because it is broken.
+    # The gesture reports which case it found, so a feed whose scroller this no
+    # longer finds is told apart from one it simply cannot move.
     scroll_to_top = """
         () => {
           const list = document.querySelector('[data-list-id="chat-messages"]');
@@ -647,6 +645,22 @@ async def get_channel_messages(
           s.scrollTo(0, 0);
           return "scrolled";
         }
+    """
+
+    # Exhaustion is a fact about content, so it is read from the one row that
+    # states it: a feed's opening banner — "Welcome to #channel!", or a thread's
+    # starter — which Discord gives the feed's own id in the
+    # `chat-messages-{feed}-{row}` slot, and which the extractor drops for that
+    # reason. Rendered, nothing older exists. Geometry answers a different
+    # question and cannot stand in: a loaded feed taller than its pane scrolls
+    # exactly like a stalled one, which is every feed here — measured
+    # 2026-08-16, `#ravos` brought its first message into view on pass 6 of 9
+    # with the scroller still reporting scrollable, then paged three more times
+    # to conclude it had stalled. Probed by id because Discord's class names are
+    # content-hashed and churn.
+    at_beginning = """
+        (channelId) => !!document.getElementById(
+            `chat-messages-${channelId}-${channelId}`)
     """
 
     # Bounded by progress, not a fixed pass count, which would silently truncate
@@ -684,6 +698,11 @@ async def get_channel_messages(
 
         if reached_since:
             stop = StopReason.WINDOW_EDGE
+            break
+        if await page.evaluate(at_beginning, channel_id):
+            # The feed's first message is rendered, so `seen` already holds the
+            # whole feed and the window's start is above anything that exists.
+            stop = StopReason.FEED_EXHAUSTED
             break
         stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
         scrolled = await page.evaluate(scroll_to_top)

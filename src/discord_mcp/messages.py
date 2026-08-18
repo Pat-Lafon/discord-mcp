@@ -25,7 +25,9 @@ async def read_recent_messages(
         channel_id=channel_id,
         since=since,
     )
-    logger.debug(f"Retrieved {len(window.messages)} total messages")
+    logger.debug(
+        f"Retrieved {len(window.messages)} total messages, stop={window.stop.value}"
+    )
 
     recent = [m for m in window.messages if m.timestamp > since]
     logger.debug(f"Filtered to {len(recent)} messages after cutoff {since}")
