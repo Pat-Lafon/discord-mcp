@@ -2,46 +2,115 @@
 
 ## Architecture
 
-Tool definitions and module layout live in `src/discord_mcp/server.py`. The `discord-mcp` console script resolves to `discord_mcp:main`, which imports `server` inside the function body: `server` builds its FastMCP at module scope, and that constructor installs a bare `%(message)s` handler on the root logger, so a client-only import (`../bin/discord_messages.py` takes `.client` and `.messages`) must not reach it.
+Tool definitions and module layout live in `src/discord_mcp/server.py`. `main` imports `server` inside
+the function body: `server` builds its FastMCP at module scope, and that constructor installs a bare
+`%(message)s` handler on the root logger, so a client-only import (`../bin/discord_messages.py` takes
+`.client` and `.messages`) must not reach it.
 
-`logger.py` configures the `discord_mcp` logger at import — DEBUG, stderr, `propagate = False` — and every consumer wants that: the MCP server logs to Claude Code's server log, the daily review captures the stream as its trace file (the only record of per-feed counts and paging timings), and an ad-hoc client drive is how this repo is tested. stdout is reserved: it is the MCP stdio channel here and the transcript channel in `../bin/discord_messages.py`.
+`logger.py` configures the `discord_mcp` logger at import — DEBUG, stderr, `propagate = False` — and
+every consumer wants that, not least the daily review, which captures the stream as its trace file:
+the only record of per-feed counts and paging timings. stdout is reserved — the MCP stdio channel here,
+the transcript channel in `../bin/discord_messages.py`.
 
-`get_channel_messages` pages by jumping the feed's scroller to 0 each pass — that is the one gesture that triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within already-rendered rows, several presses short of the top, and loads nothing. The loop is bounded by progress, not a pass count, and returns which of three exits it took as a `StopReason`: `WINDOW_EDGE` (a row older than `since` rendered), `FEED_EXHAUSTED` (the feed's opening banner rendered, so nothing older exists), or `STALLED` (three passes surfacing no new row). `covers_window` is the first two, and is what a watermark caller checks before advancing past the window. `since` is the read's only bound, and every row the passes rendered comes back: a row cap would buy wall-clock by cutting the rows nearest `since`, which is exactly what a watermark caller never revisits, and it reported the window covered while doing it.
+`get_channel_messages` pages by jumping the feed's scroller to 0 each pass, the one gesture that
+triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within
+already-rendered rows and loads nothing. The loop is bounded by progress rather than a pass count and
+returns which of three exits it took as a `StopReason`: `WINDOW_EDGE` (a row older than `since`
+rendered), `FEED_EXHAUSTED` (the feed's opening banner rendered), or `STALLED` (three passes surfacing
+no new row). `covers_window` is the first two, and is what a watermark caller checks before advancing
+past the window. `since` is the read's only bound and every rendered row comes back — a row cap would
+buy wall-clock by cutting the rows nearest `since`, exactly the ones a watermark caller never revisits,
+while reporting the window covered.
 
-Both clean exits are read off a rendered row, which leaves `STALLED` meaning only that Discord served no more history and no beginning came into view. Deciding exhaustion by geometry instead — nothing scrollable under the list — reports a stall over a feed read end to end, since a loaded feed taller than its pane scrolls exactly like a stalled one: `#ravos` brought its first message into view on pass 6 with the scroller reporting scrollable there and at every pass before it, then paged three more times to conclude it had stalled (2026-08-16). Geometry stays as a fast path for a feed shorter than its pane; the banner decides.
+Both clean exits are read off a rendered row, so `STALLED` means only that Discord served no more
+history and no beginning came into view. **Don't decide exhaustion by geometry** — nothing scrollable
+under the list — because a loaded feed taller than its pane scrolls exactly like a stalled one, so a
+feed read end to end reports as a stall. Geometry stays as a fast path for a feed shorter than its
+pane; the banner decides. Nothing scrollable under a list that exists is `FEED_EXHAUSTED`, not a stall,
+while no message list at all raises — `_open_channel` already waited for one, so that is a feed that
+vanished mid-page.
 
-The scroll gesture reports what it found rather than returning nothing: no message list at all raises, since `_open_channel` already waited for one, and it is the reading of a feed that vanished mid-page. Nothing scrollable under a list that exists is `FEED_EXHAUSTED`, not a stall.
+A message's post time comes from its id, not from the row: Discord ids are snowflakes carrying
+milliseconds since 2015-01-01 in their high 42 bits. A row cannot render without its id, so there is no
+timestamp-less row to date to now and no fallback to guess. `_posted_at` raises on a decode that is no
+post time — an id with no timestamp bits set (it decodes to the epoch instant, reads as older than any
+window, and would end paging on the spot) or a result outside Discord's lifetime (the shift or epoch
+constant is wrong). Both otherwise produce a plausible-looking date, and that date is the window
+boundary.
 
-A message's post time comes from its id, not from the row: Discord ids are snowflakes carrying milliseconds since 2015-01-01 in their high 42 bits (verified 2026-08-11 against 40 rendered rows — every one matched its `<time datetime>` exactly). A row cannot render without its id, so there is no timestamp-less row to date to now and no fallback to guess. `_posted_at` raises on a decode that is no post time — an id with no timestamp bits set (not a snowflake; it decodes to the epoch instant, reads as older than any window, and would end paging on the spot) or a result outside Discord's lifetime (the shift or epoch constant is wrong). Both otherwise produce a plausible-looking date, and this date is the window boundary.
+`get_channel_threads` reads the sidebar's thread group for the channel just navigated to and returns
+each thread as a `DiscordChannel` — a thread's id addresses it exactly like a channel, so
+`get_channel_messages` reads one unchanged. A thread's messages never appear in the parent channel's
+feed, which shows only a "started a thread" marker, so `../bin/discord_messages.py` calls it per
+configured channel and reads each thread as its own feed: `#the-furious-five` carries its traffic in
+per-arc threads and reads as empty otherwise. The sidebar lists active threads only, and no MCP tool
+exposes this.
 
-`get_channel_threads` reads the sidebar's thread group for the channel it just navigated to and returns each thread as a `DiscordChannel`: a thread's id addresses it exactly like a channel, so `get_channel_messages` reads one unchanged. No MCP tool exposes it. A thread's messages never appear in the parent channel's feed, which shows only a "started a thread" marker, so `../bin/discord_messages.py` calls it per configured channel and reads each thread as its own feed — `#the-furious-five` carries its traffic in per-arc threads and reads as empty otherwise. The sidebar lists active (non-archived) threads only; the docstring carries that boundary.
+Paging keys extractions by message id and overwrites: each pass re-extracts every rendered row, every
+field belongs to the row itself, and whichever pass last rendered it read the whole story. An edit, or
+a component that mounted late, is therefore not masked by the first thing the row was ever seen to say.
+No field merges across passes.
 
-Paging keys extractions by message id and overwrites: each pass re-extracts every rendered row, every field belongs to the row itself, and whichever pass last rendered it read the whole story. An edit, or a component that mounted late, is therefore not masked by the first thing the row was ever seen to say. No field merges across passes.
+A row's author is read from the row, not inferred from the name above it. Discord writes a username
+node only on the first row of a run, but every continuation labels itself with that node's id — the
+`message-username-*` entry in its `aria-labelledby`. That holds across virtualization, which evicts
+whole groups and never renders a continuation without its head. A reply row labels its article with the
+message it quotes, so the extractor matches the `message-username-` prefix rather than taking the first
+idref.
 
-A row's author is read from the row, not inferred from the name above it. Discord writes a username node only on the first row of a run, but every continuation labels itself with that node's id — the `message-username-*` entry in its `aria-labelledby`. Measured 2026-08-12 over 104 continuation rows on these feeds: every one carried the idref and every idref resolved, including across a pass where virtualization evicted 50 of 110 rendered rows, because Discord evicts whole groups and never renders a continuation without its head. A reply row labels its article with the message it quotes, so the extractor matches the `message-username-` prefix rather than taking the first idref.
+**A row names someone and says something, or it is not a row this extractor understands.** A row that
+reads as authorless, or as having no text, attachment, poll or link, is a selector that stopped
+matching, so it returns null and is counted rather than reported under a placeholder. The extractor
+tolerates *one* null — a pass with more than that, or more than a tenth, raises, because a half-broken
+extractor returns a short read and short is the shape of an ordinary quiet day here.
 
-**A row names someone and says something, or it is not a row this extractor understands.** Measured 2026-08-12 across the three configured feeds: 0 of 250 rows read as authorless, and 0 read as having no text, attachment, poll or link. A row that reads as either is a selector that stopped matching, so it returns null and is counted by the canary below rather than reported under a placeholder.
-
-The opening banner is the one row that is no message — a thread's starter, or a channel's "Welcome to #name!" — and Discord gives it the feed's own id, so the extractor drops the row whose trailing id segment equals the channel id it was passed. That id dates the banner to the feed's creation, which would end paging on the spot. It is also what `FEED_EXHAUSTED` is read from, by id rather than class, since class names are content-hashed and churn.
-
-Null rows in the extractor tolerate *one* bad row, so a pass where more than that (or more than a tenth) come back null raises: a half-broken extractor returns a short read, and short is the shape of an ordinary quiet day here. Three things produce a null — a row that throws, one that names no author, one that says nothing.
+The opening banner is the one row that is no message — a thread's starter, or a channel's "Welcome to
+#name!" — and Discord gives it the feed's own id, so the extractor drops the row whose trailing id
+segment equals the channel id it was passed. That id dates the banner to the feed's creation, which
+would end paging on the spot. It is also what `FEED_EXHAUSTED` is read from, by id rather than class,
+since class names are content-hashed and churn.
 
 ## Reliability
-- One browser reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its page is closed or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an async lock serializes tool calls against the shared state
-- Cookie persistence at `~/.discord_mcp_cookies.json` for login state
-- `_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare 30s default is what failed on 3 of the 22 daily runs to 2026-08-16 (2026-07-20, 07-27, 08-16), each aborting the run mid-feed; measured navigation is 16s cold and 4-7s warm, and a `wait_for_selector` timeout has never been seen — the retry that existed covered only the step that does not fail
+
+One browser is reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its
+page closes or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an
+async lock serializes tool calls against the shared state. Cookies persist at
+`~/.discord_mcp_cookies.json`.
+
+`_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare
+30s default aborted daily runs mid-feed on a cold navigation, and the retry that existed covered only
+`wait_for_selector` — the step that does not fail.
 
 ## Login (cookie-only, always)
-- `_login` probes the session, never trusting a timeout: a slow load is `Indeterminate` (re-probed once with a longer wait, then raised as `TransientLoginError` so the caller retries), never folded into `LoggedOut`. Only a positive guild-nav render is `LoggedIn`. The re-probe earns its place — 7 of the 21 daily runs to 2026-08-15 took it.
-- **Nothing here logs in.** `_login` has no credential path on any setting: `LoggedOut` raises `CookieExpiredError` (a structural `DiscordLoginError`, not retryable) naming `discord-mcp-reseed`. Nothing catches it downstream: the traceback escapes `../bin/discord_messages.py` for exit 1, and the daily review's `_last_error` lifts the traceback's final line — the message above, remedy included — into the report's `Discord prefetch failed:` line. That line's wording is what a reader of the morning report gets (measured 2026-08-11 by moving the cookie file aside and running the scrape headless).
-- **`reseed_cookie` is the only writer of the cookie file**, reached through the `discord-mcp-reseed` console script. It opens a visible browser at `/login`, blocks on stdin, and saves only once `_probe_login_state` confirms `LoggedIn` — so an Enter pressed early raises and leaves a working cookie alone. Waiting on stdin rather than a selector is what keeps Discord's login markup out of this repo: device verification, 2FA and CAPTCHA are all the human's to clear, and the form they clear them on is free to change.
-- The `goto` there carries a 120s bound against the 30s default: a cold *headed* window measured 31s to `/login` where headless took 10s (2026-08-15). The credential login this replaced used the bare default and would have timed out on the same navigation.
-- **The password is gone from the system**, and with it every env var this package read. No `DISCORD_EMAIL`/`DISCORD_PASSWORD`, no Keychain entry, no `security` calls in `../discord-mcp-launch`, no `DISCORD_HEADLESS`, no `config.py`, no `python-dotenv`. `headless` is a `ClientState` field now, set by `reseed_cookie`'s caller and left at its `True` default everywhere else — to watch a selector fail against live Discord, pass `ClientState(headless=False)` in the ad-hoc drive that Development Workflow step 3 already calls for.
 
-## Development Workflow
-1. Make changes following functional programming patterns
-2. Run what `.github/workflows/pr-checks.yml` gates a PR on, in its order: `uv run pyright`, `uv run ruff check .`, `uv run ruff format --check .`. `uv run` takes ruff from this project's pinned dev group; `uvx ruff` resolves its own version and can disagree with CI
-3. Verify the affected MCP tool(s) against live Discord — there is no test suite; drive the client path directly (e.g. `uv run --project . python -c ...` or via `../bin/discord_messages.py`)
+- `_login` probes the session and never trusts a timeout: a slow load is `Indeterminate` (re-probed
+  once with a longer wait, then raised as `TransientLoginError` so the caller retries), never folded
+  into `LoggedOut`. Only a positive guild-nav render is `LoggedIn`.
+- **Nothing here logs in.** `_login` has no credential path: `LoggedOut` raises `CookieExpiredError`
+  (structural, not retryable) naming `discord-mcp-reseed`. Nothing catches it downstream — the
+  traceback escapes `../bin/discord_messages.py` for exit 1, and the daily review's `_last_error` lifts
+  its final line, remedy included, into the report's `Discord prefetch failed:` line. That wording is
+  what a reader of the morning report gets.
+- **`reseed_cookie` is the only writer of the cookie file**, reached through the `discord-mcp-reseed`
+  console script. It opens a visible browser at `/login`, blocks on stdin, and saves only once
+  `_probe_login_state` confirms `LoggedIn` — so an Enter pressed early raises and leaves a working
+  cookie alone. Waiting on stdin rather than a selector is what keeps Discord's login markup out of
+  this repo: device verification, 2FA and CAPTCHA are all the human's to clear, and the form they clear
+  them on is free to change. Its `goto` carries a 120s bound, since a cold headed window is several
+  times slower to `/login` than a headless one.
+- `headless` is a `ClientState` field, set by `reseed_cookie`'s caller and left at its `True` default
+  everywhere else. To watch a selector fail against live Discord, pass `ClientState(headless=False)`.
+
+## Development workflow
+
+Run what `.github/workflows/pr-checks.yml` gates a PR on, in its order: `uv run pyright`,
+`uv run ruff check .`, `uv run ruff format --check .`. `uv run` takes ruff from this project's pinned
+dev group; `uvx ruff` resolves its own version and can disagree with CI. There is no test suite, so
+verify an affected MCP tool by driving the client path directly against live Discord.
 
 ## Configuration
-There is none. `../discord-mcp-launch` — the `.mcp.json` `command`, registered by absolute path — resolves the submodule beside itself and execs the server, setting no environment and reading no secret. The cookie file is the whole configuration surface, and a missing one is `_login`'s error to give at the point of use, with the reseed command in it.
+
+There is none. `../discord-mcp-launch` — the `.mcp.json` `command`, registered by absolute path —
+resolves the submodule beside itself and execs the server, setting no environment and reading no
+secret. The cookie file is the whole configuration surface, and a missing one is `_login`'s error to
+give at the point of use, with the reseed command in it.
