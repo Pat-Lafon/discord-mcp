@@ -1,103 +1,126 @@
 # Discord MCP Server (Python)
 
-## Task
-Build a Discord MCP (Model Context Protocol) server that can:
-- Read messages across multiple Discord servers and channels
-- Send messages to Discord channels  
-- List Discord servers and channels
-- Provide efficient message reading with proper chronological ordering
-- Handle authentication with Discord credentials using web scraping
+## Architecture
 
-## Use Cases
-Enable an LLM to:
-1. Monitor Discord servers and communities of interest
-2. Read and summarize recent messages from channels
-3. Send messages to Discord channels
-4. Discover available servers and channels
+Tool definitions and module layout live in `src/discord_mcp/server.py`. `main` imports `server` inside
+the function body: `server` builds its FastMCP at module scope, and that constructor installs a bare
+`%(message)s` handler on the root logger, so a client-only import (`../bin/discord_messages.py` takes
+`.client`) must not reach it.
 
-This enables automated community monitoring, content aggregation, and interaction across Discord servers for purposes like community engagement, trend monitoring, and content curation.
+`logger.py` configures the `discord_mcp` logger at import — DEBUG, stderr, `propagate = False` — and
+every consumer wants that, not least the daily review, which captures the stream as its trace file:
+the only record of per-feed counts and paging timings. stdout is reserved — the MCP stdio channel here,
+the transcript channel in `../bin/discord_messages.py`.
 
-## Implementation Approach
-This implementation uses **Playwright web scraping** instead of Discord's API because:
-- Discord's API only allows reading from servers where you have bot permissions
-- Web scraping enables reading from any Discord server you can access as a user
-- No need for bot creation or server permissions
+`get_channel_messages` pages by jumping the feed's scroller to 0 each pass, the one gesture that
+triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within
+already-rendered rows and loads nothing. The loop is bounded by progress rather than a pass count and
+returns which of three exits it took as a `StopReason`: `WINDOW_EDGE` (a row older than `since`
+rendered), `FEED_EXHAUSTED` (the feed's opening banner rendered), or `STALLED` (three passes surfacing
+no new row). `covers_window` is the first two, and is what a watermark caller checks before advancing
+past the window. `since` is the read's only bound and every row inside the window comes back — a row
+cap would buy wall-clock by cutting the rows nearest `since`, exactly the ones a watermark caller never
+revisits, while reporting the window covered. The pass that reaches the edge overshoots it, so
+`get_channel_messages` drops what it rendered past `since` before returning: one function takes the
+window and one thing honours it.
 
-## Package Management
-- Use `uv` package manager for all operations
-- Use `uv run` prefix for all Python commands
-- Use `uv add` for adding dependencies
+Both clean exits are read off a rendered row, so `STALLED` means only that Discord served no more
+history and no beginning came into view. **Don't decide exhaustion by geometry** — nothing scrollable
+under the list — because a loaded feed taller than its pane scrolls exactly like a stalled one, so a
+feed read end to end reports as a stall. Geometry stays as a fast path for a feed shorter than its
+pane; the banner decides. Nothing scrollable under a list that exists is `FEED_EXHAUSTED`, not a stall,
+while no message list at all raises — `_open_channel` already waited for one, so that is a feed that
+vanished mid-page.
 
-## Code Quality
-- Always run `uv run pyright` for Python type checking
-- Always run `uvx ruff format .` for formatting
-- Always run `uvx ruff check --fix --unsafe-fixes .` for linting
+A message's post time comes from its id, not from the row: Discord ids are snowflakes carrying
+milliseconds since 2015-01-01 in their high 42 bits. A row cannot render without its id, so there is no
+timestamp-less row to date to now and no fallback to guess. `_posted_at` raises on a decode that is no
+post time — an id with no timestamp bits set (it decodes to the epoch instant, reads as older than any
+window, and would end paging on the spot) or a result outside Discord's lifetime (the shift or epoch
+constant is wrong). Both otherwise produce a plausible-looking date, and that date is the window
+boundary.
 
-## Current Architecture
-- **`main.py`** - Entry point that starts the MCP server
-- **`src/discord_mcp/server.py`** - FastMCP server with 4 tool definitions
-- **`src/discord_mcp/client.py`** - Playwright-based Discord client with simplified message extraction
-- **`src/discord_mcp/config.py`** - Configuration management for Discord credentials
-- **`src/discord_mcp/messages.py`** - Message reading and time filtering logic
-- **`src/discord_mcp/logger.py`** - Logging setup and configuration
-- **`tests/test_integration.py`** - Integration tests for all MCP tools
+`get_guilds` and `get_guild_channels` both read through `_extract_rows`, which waits on the extractor's
+own output rather than on a container's selector — Discord renders a list's chrome ahead of what goes
+in it — and treats an empty result as breakage rather than an answer: you are in at least one guild,
+and a guild you are in shows you at least one channel, so zero would read as true and be believed.
+`get_channel_threads` is the one reader that stays out of it, waiting on the channel's own sidebar row,
+because there a zero *is* the answer.
 
-## MCP Tools Implemented
-- **`get_servers`** - List all Discord servers you have access to
-- **`get_channels(server_id)`** - List all channels in a specific Discord server
-- **`read_messages(server_id, channel_id, max_messages, hours_back?)`** - Read recent messages in chronological order (newest first)
-- **`send_message(server_id, channel_id, content)`** - Send messages to specific Discord channels (automatically splits long messages)
+`get_channel_threads` reads the sidebar's thread group for the channel just navigated to and returns
+each thread as a `DiscordChannel` — a thread's id addresses it exactly like a channel, so
+`get_channel_messages` reads one unchanged. A thread's messages never appear in the parent channel's
+feed, which shows only a "started a thread" marker, so `../bin/discord_messages.py` calls it per
+configured channel and reads each thread as its own feed: `#the-furious-five` carries its traffic in
+per-arc threads and reads as empty otherwise. The sidebar lists active threads only, and no MCP tool
+exposes this.
 
-## Dependencies
-- **mcp** - Official MCP library via FastMCP
-- **playwright** - Browser automation for Discord web scraping  
-- **python-dotenv** - Environment variable management
-- **pytest** - Testing framework
+Paging keys extractions by message id and overwrites: each pass re-extracts every rendered row, every
+field belongs to the row itself, and whichever pass last rendered it read the whole story. An edit, or
+a component that mounted late, is therefore not masked by the first thing the row was ever seen to say.
+No field merges across passes.
 
-## Test Strategy & Reliability
-The implementation prioritizes **reliability over speed** through:
+A row's author is read from the row, not inferred from the name above it. Discord writes a username
+node only on the first row of a run, but every continuation labels itself with that node's id — the
+`message-username-*` entry in its `aria-labelledby`. That holds across virtualization, which evicts
+whole groups and never renders a continuation without its head. A reply row labels its article with the
+message it quotes, so the extractor matches the `message-username-` prefix rather than taking the first
+idref.
 
-### Browser State Management
-- Complete browser reset between every MCP tool call using `_execute_with_fresh_client()`
-- Async lock serialization to prevent race conditions
-- Cookie persistence at `~/.discord_mcp_cookies.json` for login state
+**A row names someone and says something, or it is not a row this extractor understands.** A row that
+reads as authorless, or as having no text, attachment, poll or link, is a selector that stopped
+matching, so it returns null and is counted rather than reported under a placeholder. The extractor
+tolerates *one* null — a pass with more than that and more than a tenth raises, because a half-broken
+extractor returns a short read and short is the shape of an ordinary quiet day here.
 
-### Message Extraction
-- **Chronological ordering**: Messages returned newest-first
-- **Simplified extraction**: Streamlined from ~130 lines to ~54 lines
-- **Robust scrolling**: JavaScript-based scroll to bottom for newest messages
-- **Proper filtering**: Time-based and count-based message limiting
+The opening banner is the one row that is no message — a thread's starter, or a channel's "Welcome to
+#name!" — and Discord gives it the feed's own id, so the extractor drops the row whose trailing id
+segment equals the channel id it was passed. That id dates the banner to the feed's creation, which
+would end paging on the spot. It is also what `FEED_EXHAUSTED` is read from, by id rather than class,
+since class names are content-hashed and churn.
 
-### Test Execution
-- Sequential test execution (`-n 0` in pytest.ini) to avoid resource conflicts
-- Comprehensive integration tests covering all 4 MCP tools
-- 100% test reliability across multiple runs
+## Reliability
 
-## Performance Characteristics
-- **Cookie persistence** eliminates re-login overhead  
-- **JavaScript extraction** faster than clicking through UI elements
-- **Fresh browser state** adds ~2-3 seconds per tool call but ensures reliability
-- **Simplified message logic** improved performance while maintaining functionality
+One browser is reused across MCP tool calls (`_execute_with_persistent_client`), rebuilt only when its
+page closes or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an
+async lock serializes tool calls against the shared state. Cookies persist at
+`~/.discord_mcp_cookies.json`.
 
-## Development Workflow
-1. Make changes following functional programming patterns
-2. Run `uv run pyright` for type checking
-3. Run `uvx ruff format .` and `uvx ruff check --fix --unsafe-fixes .` for code quality
-4. Run `uv run pytest -v tests/` for integration testing
-5. Verify all 4 MCP tools work correctly
+`_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare
+30s default aborted daily runs mid-feed on a cold navigation, and the retry that existed covered only
+`wait_for_selector` — the step that does not fail.
+
+## Login (cookie-only, always)
+
+- `_login` probes the session and never trusts a timeout: `_probe_login_state` returns only on a
+  positive signal — a rendered guild nav is `True`, an auth url is `False` — and raises
+  `TransientLoginError` on a stall, which `_login` re-probes once with a longer wait before letting it
+  reach the caller's retry. A stall never returns `False`, so it cannot be read as signed out.
+- **Nothing here logs in.** `_login` has no credential path: a `False` probe raises `CookieExpiredError`
+  (structural, not retryable) naming `discord-mcp-reseed`. Nothing catches it downstream — the
+  traceback escapes `../bin/discord_messages.py` for exit 1, and the daily review's `_last_error` lifts
+  its final line, remedy included, into the report's `Discord prefetch failed:` line. That wording is
+  what a reader of the morning report gets.
+- **`reseed_cookie` is the only writer of the cookie file**, reached through the `discord-mcp-reseed`
+  console script. It opens a visible browser at `/login`, blocks on stdin, and saves only once
+  `_probe_login_state` confirms the session — so an Enter pressed early raises and leaves a working
+  cookie alone. Waiting on stdin rather than a selector is what keeps Discord's login markup out of
+  this repo: device verification, 2FA and CAPTCHA are all the human's to clear, and the form they clear
+  them on is free to change. Its `goto` carries a 120s bound, since a cold headed window is several
+  times slower to `/login` than a headless one.
+- `headless` is a `ClientState` field, set by `reseed_cookie`'s caller and left at its `True` default
+  everywhere else. To watch a selector fail against live Discord, pass `ClientState(headless=False)`.
+
+## Development workflow
+
+Run what `.github/workflows/pr-checks.yml` gates a PR on, in its order: `uv run pyright`,
+`uv run ruff check .`, `uv run ruff format --check .`. `uv run` takes ruff from this project's pinned
+dev group; `uvx ruff` resolves its own version and can disagree with CI. There is no test suite, so
+verify an affected MCP tool by driving the client path directly against live Discord.
 
 ## Configuration
-Set environment variables:
-```env
-DISCORD_EMAIL=your_email@example.com
-DISCORD_PASSWORD=your_password
-DISCORD_HEADLESS=true  # For production
-```
 
-## Message Ordering Behavior
-Messages are returned in **chronological order (newest first)**:
-- `max_messages: 1` returns the most recent message
-- `max_messages: 20` returns the 20 most recent messages
-- More messages means going further back in time chronologically
-
-This ordering was fixed from previous counterintuitive behavior and now works correctly and consistently.
+There is none. `../discord-mcp-launch` — the `.mcp.json` `command`, registered by absolute path —
+resolves the submodule beside itself and execs the server, setting no environment and reading no
+secret. The cookie file is the whole configuration surface, and a missing one is `_login`'s error to
+give at the point of use, with the reseed command in it.
