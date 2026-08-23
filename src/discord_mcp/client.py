@@ -155,7 +155,7 @@ async def _login(state: ClientState) -> ClientState:
 
 
 async def close_client(state: ClientState) -> None:
-    # Close resources in reverse order: page -> context -> browser -> playwright
+    # Child before parent: a page/context must not outlive the browser it lives in.
     resources = [
         (state.page, "close"),
         (state.context, "close"),
@@ -163,17 +163,15 @@ async def close_client(state: ClientState) -> None:
         (state.playwright, "stop"),
     ]
 
+    # Teardown never fails the caller's read, which has already happened — but a
+    # resource that will not close leaks a browser per run, and that is only
+    # findable if it says so.
     for resource, action in resources:
         try:
             if resource:
                 await getattr(resource, action)()
-        except Exception:
-            pass
-
-    # Force garbage collection to help cleanup
-    import gc
-
-    gc.collect()
+        except Exception as e:
+            logger.warning(f"{action} on {type(resource).__name__} failed: {e}")
 
 
 async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild]]:
