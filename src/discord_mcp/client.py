@@ -1,6 +1,7 @@
 import asyncio
+import enum
 import pathlib as pl
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 import dataclasses as dc
 from playwright.async_api import (
     Browser,
@@ -19,12 +20,41 @@ class DiscordMessage:
     id: str
     content: str
     author_name: str
-    author_id: str
     channel_id: str
     timestamp: datetime
     attachments: list[str]
 
 
+class StopReason(enum.Enum):
+    """Which of paging's three exits it took — the caller's ground for trusting
+    the read covers the window it asked for.
+
+    Each is derived from something the feed rendered, so STALLED is left holding
+    only the case where paging stopped and the feed never said why: Discord
+    served no more history and no beginning came into view.
+    """
+
+    WINDOW_EDGE = "window-edge"  # a message older than `since` was rendered
+    FEED_EXHAUSTED = "feed-exhausted"  # the feed's opening banner was rendered
+    STALLED = "stalled"  # three passes surfaced no new row
+
+    @property
+    def covers_window(self) -> bool:
+        """Whether the read reaches the window's start, so the caller may
+        advance a watermark past it."""
+        return self in (StopReason.WINDOW_EDGE, StopReason.FEED_EXHAUSTED)
+
+
+@dc.dataclass(frozen=True)
+class WindowRead:
+    """A channel read plus why paging stopped."""
+
+    messages: list[DiscordMessage]
+    stop: StopReason
+
+
+# A thread is addressed exactly like a channel — same id space, same url shape,
+# same reader (`_open_channel`) — so `get_channel_threads` returns these too.
 @dc.dataclass(frozen=True)
 class DiscordChannel:
     id: str
@@ -350,122 +380,339 @@ async def get_guild_channels(
     return state, [DiscordChannel(id=ch["id"], name=ch["name"]) for ch in rows]
 
 
-async def _extract_message_data(
-    element, channel_id: str, collected: int
-) -> DiscordMessage | None:
+# Every rendered row, read in one pass over the document: per-row would be a
+# round trip each, and the paging loop re-reads every rendered row every pass.
+# Discord hashes its class names (`markup__75297`), so selectors match a
+# substring.
+#
+# A reply row nests a preview of the quoted message — author name and text —
+# ahead of its own, in nodes class-identical to the real ones (measured
+# 2026-08-11 over 436 rows), so only the `repliedMessage` ancestor tells them
+# apart. Every lookup below ignores that subtree, or a reply reports the message
+# it quotes in place of itself and hands that author to the continuations under
+# it.
+#
+# A row that throws, or that names no author and says nothing, comes back as
+# null rather than losing the pass — one malformed row is tolerated while a DOM
+# change that trips every row still reaches the caller's canary.
+_EXTRACT_ROWS_JS = """
+(channelId) => {
+  const own = (el) => !el.closest('[class*="repliedMessage"]');
+  // Discord renders every emoji as an <img> whose alt carries what was typed —
+  // the character for a unicode emoji, `:name:` for a custom one — so
+  // textContent alone drops it (measured 2026-08-11: 9 messages lost a
+  // mid-sentence emoji, 3 emoji-only messages read as empty).
+  //
+  // Chrome that Discord nests *inside* the content node is dropped first, or it
+  // reads as message text: a `timestamp` span holds the `(edited)` marker plus
+  // the same instant spelled out for screen readers, and `hiddenVisually` spans
+  // hold separators meant only to be read aloud (measured 2026-08-11 over 57
+  // content nodes: 2 ended in "(edited)Sunday, July 19, 2026 at 8:06 PM", 5
+  // carried a stray comma). Both are addressed to a screen reader or duplicate
+  // what the row's id already dates, so nothing is lost by removing them.
+  const readText = (el) => {
+    const clone = el.cloneNode(true);
+    for (const chrome of clone.querySelectorAll(
+        '[class*="timestamp"], [class*="hiddenVisually"]')) {
+      chrome.remove();
+    }
+    for (const img of clone.querySelectorAll('img[alt]')) {
+      img.replaceWith(img.getAttribute('alt'));
+    }
+    return clone.textContent.trim();
+  };
+  // First own match holding text. Scanning past the empty ones is what reads a
+  // forward: Discord leaves the row's own content node empty and puts the
+  // forwarded body in a second one below it (6 such rows, 2026-08-11).
+  const firstNode = (root, selector) =>
+    [...root.querySelectorAll(selector)].find((el) => own(el) && readText(el));
+  const textOf = (root, selector) => {
+    const el = firstNode(root, selector);
+    return el ? readText(el) : "";
+  };
+
+  // A poll's question and options are their own component, outside the content
+  // node, so without this a poll row's text reads as empty.
+  const pollOf = (row) => {
+    const box = row.querySelector('[class*="pollContainer"]');
+    if (!box) return null;
+    return {
+      question: textOf(box, 'h4'),
+      options: [...box.querySelectorAll('li[class*="answer__"]')].map((li) => ({
+        label: textOf(li, '[class*="label__"]'),
+        votes: textOf(li, '[class*="votesData"] [class*="text__"]'),
+      })),
+    };
+  };
+
+  // `chat-messages-{channelId}-{messageId}` — the trailing segment is the
+  // snowflake the caller dates the row from. A thread's opening banner is the
+  // one rendered row that is no message, and Discord gives it the thread's own
+  // id there; dropped here, since that id dates it to the thread's creation.
+  const rows = [...document.querySelectorAll(
+      '[data-list-id="chat-messages"] [id^="chat-messages-"]')]
+      .filter((row) => row.id.split('-').pop() !== channelId);
+  return rows.map((row) => {
+    try {
+      const contentEl = firstNode(row, '[class*="markup"]');
+      // Discord marks a forward with a quote spine sitting *beside* the
+      // snapshot's content rather than wrapping it, so the snapshot's root is
+      // that spine's parent. A comment the author added sits in a content node
+      // of its own ahead of the snapshot, so it is read first and goes
+      // unmarked. `quote__` is specific to this spine — a markdown blockquote
+      // is `blockquoteContainer__`/`blockquoteDivider__` (2026-08-11).
+      const forwarded = !!contentEl
+          && [...row.querySelectorAll('[class*="quote__"]')]
+              .some((spine) => spine.parentElement.contains(contentEl));
+      // A link or video posted with no text puts the URL nowhere but the
+      // unfurl's anchor. Attachments already carry the cdn links, so excluding
+      // them here keeps such a row from reporting its file twice.
+      const link = [...row.querySelectorAll(
+          'a[href^="http"]:not([href*="cdn.discordapp.com"])')].find(own);
+      // Discord writes a username node only on the first row of a run, but
+      // every continuation labels itself with that row's username node by id,
+      // so authorship is read from the row rather than inferred from the
+      // nearest name above it. Measured 2026-08-12 over 104 continuation rows:
+      // every one carried a `message-username-*` idref and every idref
+      // resolved, including across a pass where virtualization evicted 50 rows
+      // — Discord evicts whole groups, so a continuation is never rendered
+      // without its head. A reply row labels its article with the message it
+      // quotes, so the prefix is matched rather than the first idref taken.
+      const usernameRef = [...row.querySelectorAll('[aria-labelledby]')]
+          .flatMap((el) => (el.getAttribute('aria-labelledby') || '').split(' '))
+          .find((ref) => ref.startsWith('message-username-'));
+      const named = usernameRef ? document.getElementById(usernameRef) : null;
+      const authorName =
+          textOf(row, '[class*="username"]') || (named ? readText(named) : "");
+      const poll = pollOf(row);
+      const content = contentEl ? readText(contentEl) : "";
+      const attachments = [...row.querySelectorAll(
+          'a[href*="cdn.discordapp.com"]')].filter(own)
+          .map((a) => a.getAttribute('href'));
+      // A row names someone and says something. Neither failed once across the
+      // 250 rows of these feeds measured 2026-08-12, so a row that reads as
+      // neither is a selector that stopped matching rather than a kind of row
+      // — it joins the malformed ones the caller's canary counts.
+      if (!authorName) return null;
+      if (!content && !poll && !link && !attachments.length) return null;
+      return {
+        id: row.id.split('-').pop(),
+        authorName: authorName,
+        content: content,
+        forwarded: forwarded,
+        poll: poll,
+        link: link ? link.getAttribute('href') : null,
+        attachments: attachments,
+      };
+    } catch (e) {
+      return null;
+    }
+  });
+}
+"""
+
+
+def _content(raw: dict) -> str:
+    """What the message says, as one string. A poll and a bare link say it
+    outside the content node, so each is rendered here rather than carried as
+    its own field — `content` is the whole contract every consumer reads."""
+    body = raw["content"]
+    if not body and (poll := raw["poll"]):
+        body = "\n".join(
+            [f"**Poll: {poll['question']}**"]
+            + [f"- {o['label']} — {o['votes']}" for o in poll["options"]]
+        )
+    if not body and raw["link"]:
+        body = raw["link"]
+    if body and raw["forwarded"]:
+        body = f"_Forwarded:_\n{body}"
+    return body
+
+
+# Discord ids are snowflakes: the high 42 bits are milliseconds since
+# 2015-01-01, so an id carries its own post time. Dating a row from its id
+# rather than its `<time>` element leaves nothing to guess at — a row cannot
+# exist without an id, where a missing datetime would date it to now and so
+# read as inside every window.
+_SNOWFLAKE_EPOCH_MS = 1420070400000
+_DISCORD_EPOCH = datetime.fromtimestamp(_SNOWFLAKE_EPOCH_MS / 1000, UTC)
+
+
+def _posted_at(message_id: str) -> datetime:
+    since_epoch_ms = int(message_id) >> 22
+    posted = datetime.fromtimestamp((since_epoch_ms + _SNOWFLAKE_EPOCH_MS) / 1000, UTC)
+    # Two ways this can be a date rather than a post time, both of which would
+    # otherwise read as plausible and move the window boundary every caller
+    # reads. An id with no timestamp bits set is no snowflake — it decodes to
+    # the epoch instant itself, which the strict bound below rejects, since it
+    # reads as older than any window and would end paging on the spot. A decode
+    # landing outside Discord's lifetime means the shift or epoch is wrong.
+    if not (_DISCORD_EPOCH < posted <= datetime.now(UTC) + timedelta(minutes=5)):
+        raise ValueError(
+            f"id {message_id} decodes to {posted.isoformat()}, which is no post"
+            " time; snowflake decoding is wrong or this id is not a message id"
+        )
+    return posted
+
+
+def _message(raw: dict, channel_id: str) -> DiscordMessage:
+    """The message a row amounts to. Every field is the row's own, so the
+    extraction a pass returns is the whole message."""
+    return DiscordMessage(
+        id=raw["id"],
+        content=_content(raw),
+        author_name=raw["authorName"],
+        channel_id=channel_id,
+        timestamp=_posted_at(raw["id"]),
+        attachments=raw["attachments"],
+    )
+
+
+async def _open_channel(
+    state: ClientState, server_id: str, channel_id: str
+) -> tuple[ClientState, Page]:
+    """Navigate to a channel (or thread — a thread is addressed like a channel)
+    and wait for its message list. Both steps are flaky, so both get the same
+    generous bound and one retry: the chat list usually appears in ~2s but
+    sometimes stalls indefinitely, and the navigation itself is what timed out on
+    3 of the 22 daily runs to 2026-08-16 — the bare 30s default against a 16s
+    cold start. Re-navigating rather than reloading is what recovers a `goto`
+    that left the page nowhere."""
+    state = await _login(state)
+    page = _require_page(state)
+    url = f"https://discord.com/channels/{server_id}/{channel_id}"
+
+    async def open_once() -> None:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=60000)
+
     try:
-        message_id = (
-            await element.get_attribute("id") or f"message-{collected}"
-        ).replace("chat-messages-", "")
-
-        content = ""
-        for selector in [
-            '[class*="messageContent"]',
-            '[class*="markup"]',
-            ".messageContent",
-        ]:
-            content_elem = await element.query_selector(selector)
-            if content_elem and (text := await content_elem.text_content()):
-                content = text.strip()
-                break
-
-        author_name = "Unknown"
-        for selector in ['[class*="username"]', '[class*="authorName"]', ".username"]:
-            author_elem = await element.query_selector(selector)
-            if author_elem and (name := await author_elem.text_content()):
-                author_name = name.strip()
-                break
-
-        timestamp_elem = await element.query_selector("time")
-        timestamp_str = (
-            await timestamp_elem.get_attribute("datetime") if timestamp_elem else None
-        )
-        timestamp = (
-            datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            if timestamp_str
-            else datetime.now(timezone.utc)
-        )
-
-        attachments = [
-            href
-            for att in await element.query_selector_all('a[href*="cdn.discordapp.com"]')
-            if (href := await att.get_attribute("href"))
-        ]
-
-        if not content and not attachments:
-            return None
-
-        return DiscordMessage(
-            id=message_id,
-            content=content,
-            author_name=author_name,
-            author_id="unknown",
-            channel_id=channel_id,
-            timestamp=timestamp,
-            attachments=attachments,
-        )
-    except Exception:
-        return None
+        await open_once()
+    except PlaywrightTimeoutError:
+        await open_once()
+    return state, page
 
 
 async def get_channel_messages(
     state: ClientState,
     server_id: str,
     channel_id: str,
-    limit: int = 100,
-    before: str | None = None,
-    after: str | None = None,
-) -> tuple[ClientState, list[DiscordMessage]]:
-    state = await _login(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
+    since: datetime,
+) -> tuple[ClientState, WindowRead]:
+    """Read a channel's (or thread's) messages in the window `since` opens,
+    newest first.
 
-    await state.page.goto(
-        f"https://discord.com/channels/{server_id}/{channel_id}",
-        wait_until="domcontentloaded",
-    )
-    await state.page.wait_for_selector('[data-list-id="chat-messages"]', timeout=15000)
+    `since` is the only bound on the read: one message older than the window
+    ends the loop, so a quiet channel costs one pass and a busy one pays for
+    every message its caller asked to see. A row cap would buy wall-clock by
+    cutting the *oldest* rows read — the ones nearest `since`, which a watermark
+    caller never revisits.
+    """
+    state, page = await _open_channel(state, server_id, channel_id)
 
     # Scroll to bottom for newest messages
-    await state.page.evaluate("""
+    await page.evaluate("""
         const chat = document.querySelector('[data-list-id="chat-messages"]');
         if (chat) chat.scrollTo(0, chat.scrollHeight);
         window.scrollTo(0, document.body.scrollHeight);
     """)
-    await state.page.wait_for_timeout(2000)
+    await page.wait_for_timeout(2000)
 
-    messages = []
-    seen_ids = set()
+    seen: dict[str, dict] = {}
+    reached_since = False
+    stalled_passes = 0
+    stop = StopReason.STALLED
 
-    for attempt in range(10):
-        elements = await state.page.query_selector_all(
-            '[data-list-id="chat-messages"] [id^="chat-messages-"]'
+    # Discord loads older history only when the feed's scroller reaches its top,
+    # and each chunk prepends content that pushes the viewport back down, so the
+    # scroller is jumped to 0 each pass. A keyboard PageUp moves one viewport
+    # within already-rendered rows and loads nothing (measured 2026-07-30).
+    #
+    # The gesture reports which case it found, so a feed whose scroller this no
+    # longer finds is told apart from one it simply cannot move.
+    scroll_to_top = """
+        () => {
+          const list = document.querySelector('[data-list-id="chat-messages"]');
+          if (!list) return "no-list";
+          let s = list;
+          while (s && s.scrollHeight <= s.clientHeight + 1) s = s.parentElement;
+          if (!s) return "not-scrollable";
+          s.scrollTo(0, 0);
+          return "scrolled";
+        }
+    """
+
+    # The opening banner carries the feed's own id (the row the extractor drops
+    # below), so its presence says nothing older exists. Geometry cannot stand in
+    # for that: a loaded feed taller than its pane scrolls exactly like a stalled
+    # one, which is every feed here. By id, since class names are hashed.
+    at_beginning = """
+        (channelId) => !!document.getElementById(
+            `chat-messages-${channelId}-${channelId}`)
+    """
+
+    # Bounded by progress, not a fixed pass count, which would silently truncate
+    # the old end of any window needing more passes than the cap.
+    while stalled_passes < 3:
+        extracted = await page.evaluate(_EXTRACT_ROWS_JS, channel_id)
+        # The per-row catch is there to tolerate one malformed row. Past that,
+        # the extractor is broken against a changed DOM, and the tell is a read
+        # that comes back short rather than empty — short reads as a quiet
+        # channel, which is the shape of an ordinary day here.
+        nulls = sum(row is None for row in extracted)
+        if nulls > max(1, len(extracted) // 10):
+            raise RuntimeError(
+                f"channel {channel_id}: {nulls} of {len(extracted)} rendered rows"
+                " failed to extract; message extractor is broken (likely a"
+                " Discord DOM change)"
+            )
+        logger.debug(
+            f"pass: {len(extracted)} rows rendered ({nulls} unreadable),"
+            f" {len(seen)} unique so far, stalled={stalled_passes}"
         )
-        if not elements:
-            await state.page.keyboard.press("PageUp")
-            await state.page.wait_for_timeout(1000)
-            continue
-
-        for element in reversed(elements):
-            if len(messages) >= limit:
-                break
-            try:
-                message = await _extract_message_data(
-                    element, channel_id, len(seen_ids)
-                )
-                if message and message.id not in seen_ids:
-                    if before and message.id >= before:
-                        continue
-                    if after and message.id <= after:
-                        continue
-                    seen_ids.add(message.id)
-                    messages.append(message)
-            except Exception:
+        known_before_pass = len(seen)
+        for raw in extracted:
+            if raw is None:
                 continue
+            # Rows walk backward in time, so one past the edge means the window
+            # is covered.
+            if _posted_at(raw["id"]) < since:
+                reached_since = True
+            # Every field belongs to the row itself, so whichever pass last
+            # rendered it read the whole story and simply overwrites — an edit,
+            # or a component that mounted late, is not masked by the first
+            # thing this row was ever seen to say.
+            seen[raw["id"]] = raw
 
-        if len(messages) >= limit or not elements:
+        if reached_since:
+            stop = StopReason.WINDOW_EDGE
             break
-        await state.page.keyboard.press("PageUp")
-        await state.page.wait_for_timeout(1000)
+        if await page.evaluate(at_beginning, channel_id):
+            stop = StopReason.FEED_EXHAUSTED
+            break
+        stalled_passes = 0 if len(seen) > known_before_pass else stalled_passes + 1
+        scrolled = await page.evaluate(scroll_to_top)
+        if scrolled == "no-list":
+            raise RuntimeError(
+                f"channel {channel_id}: message list vanished mid-page; paging"
+                " is broken (failed load or Discord DOM change)"
+            )
+        if scrolled == "not-scrollable":
+            # Every row the feed has fits one viewport, so there is no older
+            # history to load and the read is whole, not merely stalled.
+            stop = StopReason.FEED_EXHAUSTED
+            break
+        await page.wait_for_timeout(1000)
 
-    return state, sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit]
+    # The pass that reaches the window's edge overshoots it, so the rows it
+    # rendered past `since` are dropped here rather than handed to a caller that
+    # asked for a window.
+    messages = [
+        m for raw in seen.values() if (m := _message(raw, channel_id)).timestamp > since
+    ]
+    logger.debug(f"{len(messages)} messages after {since}, stop={stop.value}")
+
+    return state, WindowRead(
+        messages=sorted(messages, key=lambda m: m.timestamp, reverse=True),
+        stop=stop,
+    )

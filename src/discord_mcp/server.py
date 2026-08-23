@@ -3,6 +3,7 @@ import typing as tp
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import Error as PlaywrightError
@@ -11,10 +12,10 @@ from .client import (
     ClientState,
     get_guilds,
     get_guild_channels,
+    get_channel_messages,
     close_client,
     TransientLoginError,
 )
-from .messages import read_recent_messages
 
 
 @dataclass
@@ -96,23 +97,20 @@ async def get_channels(server_id: str) -> list[dict[str, str]]:
 
 @mcp.tool()
 async def read_messages(
-    server_id: str, channel_id: str, max_messages: int, hours_back: int = 24
+    server_id: str, channel_id: str, hours_back: int = 24
 ) -> list[dict[str, tp.Any]]:
     """Read recent messages from a specific channel"""
     if not (1 <= hours_back <= 8760):
         raise ValueError("hours_back must be between 1 and 8760 (1 year)")
-    if not (1 <= max_messages <= 1000):
-        raise ValueError("max_messages must be between 1 and 1000")
 
     ctx = mcp.get_context()
     discord_ctx = tp.cast(DiscordContext, ctx.request_context.lifespan_context)
+    since = datetime.now(UTC) - timedelta(hours=hours_back)
 
     async def operation(state):
-        return await read_recent_messages(
-            state, server_id, channel_id, hours_back, max_messages
-        )
+        return await get_channel_messages(state, server_id, channel_id, since)
 
-    messages = await _execute_with_persistent_client(discord_ctx, operation)
+    window = await _execute_with_persistent_client(discord_ctx, operation)
     return [
         {
             "id": m.id,
@@ -121,7 +119,7 @@ async def read_messages(
             "timestamp": m.timestamp.isoformat(),
             "attachments": m.attachments,
         }
-        for m in messages
+        for m in window.messages
     ]
 
 
