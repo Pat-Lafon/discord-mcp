@@ -42,8 +42,6 @@ class DiscordGuild:
 
 @dc.dataclass(frozen=True)
 class ClientState:
-    email: str
-    password: str
     headless: bool = True
     playwright: Playwright | None = None
     browser: Browser | None = None
@@ -53,12 +51,6 @@ class ClientState:
     cookies_file: pl.Path = dc.field(
         default_factory=lambda: pl.Path.home() / ".discord_mcp_cookies.json"
     )
-
-
-def create_client_state(
-    email: str, password: str, headless: bool = True
-) -> ClientState:
-    return ClientState(email=email, password=password, headless=headless)
 
 
 async def _ensure_browser(state: ClientState) -> ClientState:
