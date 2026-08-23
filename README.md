@@ -95,18 +95,13 @@ Add to `~/.claude/claude_desktop_config.json`:
 ## Development
 
 ```bash
-# Type checking
 uv run pyright
-
-# Formatting
-uvx ruff format .
-
-# Linting
-uvx ruff check --fix --unsafe-fixes .
-
-# Testing
-uv run pytest -v tests/
+uv run ruff check .
+uv run ruff format --check .
 ```
+
+Run them through `uv run` rather than `uvx`, which resolves a ruff version of its own
+and can disagree with CI.
 
 ## Security Notes
 
