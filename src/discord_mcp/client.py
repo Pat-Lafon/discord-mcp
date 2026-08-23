@@ -2,7 +2,15 @@ import asyncio
 import pathlib as pl
 from datetime import datetime, timezone
 import dataclasses as dc
-from playwright.async_api import async_playwright, Browser, Page, Playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 from .logger import logger
 
 
@@ -39,7 +47,7 @@ class ClientState:
     headless: bool = True
     playwright: Playwright | None = None
     browser: Browser | None = None
-    context: object | None = None  # BrowserContext
+    context: BrowserContext | None = None
     page: Page | None = None
     logged_in: bool = False
     cookies_file: pl.Path = dc.field(
@@ -76,33 +84,111 @@ async def _save_storage_state(state: ClientState) -> None:
         await state.page.context.storage_state(path=str(state.cookies_file))
 
 
-async def _check_logged_in(state: ClientState) -> bool:
+def _require_page(state: ClientState) -> Page:
     if not state.page:
-        return False
+        raise RuntimeError("Browser page not initialized")
+    return state.page
+
+
+class DiscordLoginError(Exception):
+    """Login failed structurally; retrying the automated fetch won't help."""
+
+
+class TransientLoginError(DiscordLoginError):
+    """A stall or unconfirmed state; the retry loop may clear it."""
+
+
+class CookieExpiredError(DiscordLoginError):
+    """The persisted session is gone. Nothing here logs in — Discord's device
+    verification, 2FA and CAPTCHA all expect a person — so this surfaces for a
+    manual reseed instead."""
+
+
+def _is_auth_url(url: str) -> bool:
+    return "/login" in url or "/register" in url
+
+
+async def _probe_login_state(
+    state: ClientState, *, guild_nav_timeout_ms: int = 20000
+) -> bool:
+    """Whether the session is signed in, read only from positive signals: a
+    rendered guild nav is True and an auth url is False. A stall or an error
+    raises `TransientLoginError` instead of returning False, so a slow page load
+    can't masquerade as a logged-out session and send a working cookie off to be
+    reseeded by hand."""
+    page = _require_page(state)
     try:
-        await state.page.goto(
+        await page.goto(
             "https://discord.com/channels/@me", wait_until="domcontentloaded"
         )
-        await state.page.wait_for_selector(
+    except PlaywrightError as e:
+        raise TransientLoginError(f"navigation to /channels/@me failed: {e}") from e
+
+    if _is_auth_url(page.url):
+        return False
+
+    try:
+        await page.wait_for_selector(
             '[data-list-id="guildsnav"] [role="treeitem"]',
             state="visible",
-            timeout=15000,
+            timeout=guild_nav_timeout_ms,
         )
-
-        url = state.page.url
-        if (
-            any(path in url for path in ["/login", "/register"])
-            or "/channels/@me" not in url
-        ):
+    except PlaywrightTimeoutError as e:
+        # A late redirect to /login can land while we wait on the nav, so recheck
+        # the url before calling it a stall.
+        if _is_auth_url(page.url):
             return False
+        raise TransientLoginError(
+            f"guild nav not visible within {guild_nav_timeout_ms}ms (url={page.url})"
+        ) from e
+    except PlaywrightError as e:
+        raise TransientLoginError(f"guild nav probe errored: {e}") from e
 
-        return bool(
-            await state.page.query_selector(
-                '[data-list-id="guildsnav"] [role="treeitem"]'
-            )
+    # Guild nav rendered — we're in. The url can still read /channels/@me and lag
+    # the render, so don't gate this on it.
+    return True
+
+
+async def reseed_cookie(state: ClientState) -> ClientState:
+    """Open a visible browser at Discord's login page and persist the session a
+    human signs in with. The only writer of the cookie file.
+
+    Authentication is the human's whole job here: device verification, 2FA and
+    CAPTCHA each expect a person, and driving the login form around them means
+    tracking Discord's markup for a path that runs about once a quarter. So this
+    waits on stdin rather than on any selector, and reads the result through the
+    same guild-nav probe every other caller trusts.
+    """
+    if state.headless:
+        raise ValueError(
+            "reseed needs a visible browser: build the state headless=False"
         )
-    except Exception:
-        return False
+
+    state = await _ensure_browser(state)
+    page = _require_page(state)
+    # domcontentloaded, as everywhere else here: Discord's `load` waits on the
+    # whole SPA. The 120s bound is for this path alone — a cold headed window
+    # measured 31s against headless's 10s on 2026-08-15, and the default 30s
+    # timed out on a reseed nobody would know how to read as "too slow".
+    await page.goto(
+        "https://discord.com/login", wait_until="domcontentloaded", timeout=120000
+    )
+
+    # input() off the event loop: the browser is a live subprocess this coroutine
+    # still owns, and blocking here stops answering it.
+    await asyncio.get_running_loop().run_in_executor(
+        None, input, "Sign in at the browser window, then press Enter here: "
+    )
+
+    # Confirm before writing: an Enter pressed early would otherwise persist a
+    # logged-out state over the cookie that was working. A stalled probe raises
+    # too, so the write is reached only by a session read as signed in.
+    if not await _probe_login_state(state):
+        raise DiscordLoginError("not signed in; cookie file left alone")
+
+    await _save_storage_state(state)
+    logger.info(f"session saved to {state.cookies_file}")
+    return dc.replace(state, logged_in=True)
 
 
 async def _login(state: ClientState) -> ClientState:
@@ -110,48 +196,23 @@ async def _login(state: ClientState) -> ClientState:
         return state
 
     state = await _ensure_browser(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
 
-    if await _check_logged_in(state):
+    # A stalled probe (slow load) re-probes with a longer wait rather than
+    # calling the cookie dead, which would send a working session to reseed. The
+    # second stall propagates, and the caller's retry is what clears it.
+    try:
+        signed_in = await _probe_login_state(state)
+    except TransientLoginError as e:
+        logger.debug(f"login state indeterminate ({e}); re-probing")
+        signed_in = await _probe_login_state(state, guild_nav_timeout_ms=45000)
+
+    if signed_in:
         return dc.replace(state, logged_in=True)
 
-    await state.page.goto("https://discord.com/login")
-    await asyncio.sleep(2)
-
-    await state.page.fill('input[name="email"]', state.email)
-    await state.page.fill('input[name="password"]', state.password)
-    await state.page.click('button[type="submit"]')
-
-    try:
-        await state.page.wait_for_function(
-            "() => !window.location.href.includes('/login')", timeout=60000
-        )
-        await asyncio.sleep(3)
-
-        if (
-            "/verify" in state.page.url
-            or await state.page.locator('text="Check your email"').count()
-        ):
-            await state.page.wait_for_function(
-                "() => window.location.href.includes('/channels/')", timeout=120000
-            )
-
-        if await _check_logged_in(state):
-            was_logged_in = state.logged_in
-            state = dc.replace(state, logged_in=True)
-            await asyncio.sleep(5)
-            if state.page:
-                await state.page.goto("https://discord.com/channels/@me")
-            await asyncio.sleep(3)
-
-            if not was_logged_in:
-                await _save_storage_state(state)
-            return state
-        else:
-            raise RuntimeError("Login appeared to succeed but verification failed")
-    except Exception as e:
-        raise RuntimeError(f"Failed to login to Discord: {e}")
+    raise CookieExpiredError(
+        "Discord session cookie is expired or missing; reseed it by running"
+        " `discord-mcp-reseed` and signing in at the browser it opens"
+    )
 
 
 async def close_client(state: ClientState) -> None:

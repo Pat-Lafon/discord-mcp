@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 discord-mcp = "discord_mcp:main"
+discord-mcp-reseed = "discord_mcp:reseed_main"
 
 [tool.ruff]
 # 88 is ruff's own default, so this looks redundant and is not: without a
