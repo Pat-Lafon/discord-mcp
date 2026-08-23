@@ -29,15 +29,12 @@ class DiscordMessage:
 class DiscordChannel:
     id: str
     name: str
-    type: int
-    guild_id: str | None
 
 
 @dc.dataclass(frozen=True)
 class DiscordGuild:
     id: str
     name: str
-    icon: str | None = None
 
 
 @dc.dataclass(frozen=True)
@@ -227,198 +224,130 @@ async def close_client(state: ClientState) -> None:
             logger.warning(f"{action} on {type(resource).__name__} failed: {e}")
 
 
+async def _extract_rows(
+    page: Page, js: str, arg: str | None = None, *, what: str, timeout_ms: int = 30000
+) -> list[dict]:
+    """The rows `js` extracts, once it has some. Waiting on the extractor's own
+    output is what makes the wait mean "the contents are here": Discord renders a
+    list's chrome ahead of what goes in it, so waiting on the container's own
+    selector returns it empty.
+
+    An extractor that never returns a row is a failed render or a Discord DOM
+    change. The empty list it would otherwise hand back reads as a true answer —
+    you belong to no guild, this guild has no channel — and gets believed, so
+    empty is a failure here rather than a result.
+    """
+    try:
+        await page.wait_for_function(
+            f"(a) => ({js})(a).length > 0", arg, timeout=timeout_ms
+        )
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(
+            f"nothing rendered in {what} within {timeout_ms}ms;"
+            " the extractor is broken (likely a Discord DOM change)"
+        ) from e
+    return await page.evaluate(js, arg)
+
+
+# A guild row is a rail treeitem whose id suffix is the guild's snowflake — the
+# numeric test is what drops the rail's own chrome (`home`, `create-join-button`,
+# `guild-discover-button`, `app-download-button`). querySelectorAll sees every
+# guild regardless of scroll.
+_EXTRACT_GUILDS_JS = r"""
+    () => {
+        const guilds = [];
+        const seen = new Set();
+        const rows = document.querySelectorAll('[data-list-id="guildsnav"] [role="treeitem"]');
+        for (const item of rows) {
+            const id = item.getAttribute('data-list-item-id')?.replace('guildsnav___', '');
+            if (!id || !/^[0-9]+$/.test(id) || seen.has(id)) continue;
+            // A guild row renders as an icon, so its name is the one thing on it
+            // written for screen readers. Read that accessible name — the row's
+            // text minus every aria-hidden subtree — rather than plain textContent:
+            // a guild with no uploaded icon renders its acronym in an aria-hidden
+            // node, which textContent joined to the name as "Wrath and Glory 40kWaG4"
+            // (measured 2026-08-16, once aria-label had gone from these rows).
+            const named = item.cloneNode(true);
+            for (const hidden of named.querySelectorAll('[aria-hidden="true"]')) hidden.remove();
+            // The unread badge is spelled into that name and takes either end:
+            // "Unread messages, Dungeons of Purdue" and "Lets *Actually* Kill The
+            // Devil , 2 unread messages" (measured 2026-08-11 over 10 guilds). Left
+            // in, it becomes part of the name and changes as messages arrive.
+            const name = named.textContent
+                .replace(/^unread messages,\s*/i, '')
+                .replace(/^\d+\s+(mentions?|notifications?|unread),?\s*/i, '')
+                .replace(/\s*,\s*\d+\s+unread\s+messages?$/i, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (name) {
+                seen.add(id);
+                guilds.push({ id, name });
+            }
+        }
+        return guilds;
+    }
+"""
+
+
 async def get_guilds(state: ClientState) -> tuple[ClientState, list[DiscordGuild]]:
     state = await _login(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
+    page = _require_page(state)
 
-    logger.debug("Starting guild detection process")
-    await state.page.goto(
-        "https://discord.com/channels/@me", wait_until="domcontentloaded"
-    )
-    logger.debug(f"Navigated to Discord, current URL: {state.page.url}")
+    await page.goto("https://discord.com/channels/@me", wait_until="domcontentloaded")
 
-    # Wait for Discord to fully load guilds with text content
-    try:
-        await state.page.wait_for_selector(
-            '[data-list-id="guildsnav"] [role="treeitem"]',
-            state="visible",
-            timeout=15000,
-        )
-        await state.page.wait_for_timeout(5000)
+    # The rail's guilds arrive with the gateway's READY payload, about half a
+    # second behind its chrome. One payload renders in one commit, so there is no
+    # partial rail to catch: measured 2026-08-16, the count steps straight from 0
+    # to all 9 on every navigation, including under a 20x CPU throttle that
+    # stretched the wait to 78s. A logged-in account is in at least one guild.
+    rows = await _extract_rows(page, _EXTRACT_GUILDS_JS, what="the guild rail")
+    return state, [DiscordGuild(id=g["id"], name=g["name"]) for g in rows]
 
-        # Scroll guild navigation to load all guilds
-        await state.page.evaluate("""
-            () => {
-                const guildNav = document.querySelector('[data-list-id="guildsnav"]');
-                const container = guildNav?.closest('[class*="guilds"]') || guildNav?.parentElement;
-                if (container) {
-                    container.scrollTop = 0;
-                    return new Promise(resolve => {
-                        let scrolls = 0;
-                        const interval = setInterval(() => {
-                            container.scrollBy(0, 100);
-                            if (++scrolls >= 20 || container.scrollTop + container.clientHeight >= container.scrollHeight - 10) {
-                                clearInterval(interval);
-                                resolve();
-                            }
-                        }, 100);
-                    });
-                }
-            }
-        """)
-        await state.page.wait_for_timeout(2000)
-    except Exception:
-        pass
 
-    # Extract guild information from navigation elements
-    guilds_data = await state.page.evaluate("""
-        () => {
-            const guilds = [];
-            const treeItems = document.querySelectorAll('[data-list-id="guildsnav"] [role="treeitem"]');
-            
-            treeItems.forEach(item => {
-                const listItemId = item.getAttribute('data-list-item-id');
-                if (listItemId?.startsWith('guildsnav___') && listItemId !== 'guildsnav___home') {
-                    const guildId = listItemId.replace('guildsnav___', '');
-                    if (/^[0-9]+$/.test(guildId)) {
-                        // Extract guild name from tree item text
-                        let guildName = null;
-                        const textElements = item.querySelectorAll('*');
-                        for (let elem of textElements) {
-                            const text = elem.textContent?.trim();
-                            if (text && text.length > 2 && text.length < 100 && 
-                                !text.includes('notification') && !text.includes('unread') &&
-                                !text.match(/^\\d+$/)) {
-                                guildName = text;
-                                break;
-                            }
-                        }
-                        
-                        if (!guildName) {
-                            const fullText = item.textContent?.trim();
-                            if (fullText) {
-                                guildName = fullText.replace(/^\\d+\\s+mentions?,\\s*/, '').replace(/\\s+/g, ' ').trim();
-                            }
-                        }
-                        
-                        // Clean up mention prefixes
-                        if (guildName) {
-                            guildName = guildName.replace(/^\\d+\\s+mentions?,\\s*/, '').trim();
-                        }
-                        
-                        if (guildName && !guilds.some(g => g.id === guildId)) {
-                            guilds.push({ id: guildId, name: guildName });
-                        }
-                    }
-                }
+# Channel rows are read from their sidebar links: a `/channels/{guild}/{channel}`
+# href is what makes a link a channel, and the guild segment is compared rather
+# than interpolated into the pattern so the id never reaches a regex.
+_EXTRACT_CHANNELS_JS = r"""
+    (guildId) => {
+        const channels = new Map();
+        for (const link of document.querySelectorAll('a[href*="/channels/"]')) {
+            const match = link.href.match(/\/channels\/([0-9]+)\/([0-9]+)/);
+            if (!match || match[1] !== guildId || channels.has(match[2])) continue;
+            // The row's own text runs the channel type and its hover buttons
+            // together with the name ("TextannouncementsInvite to Channel",
+            // measured 2026-08-11), so read the name node when there is one and
+            // fall back to scrubbing the row only when there isn't.
+            const nameNode = link.querySelector('[class*="name"]');
+            const name = ((nameNode ?? link).textContent || '')
+                .replace(/\s+/g, ' ').trim();
+            channels.set(match[2], {
+                id: match[2],
+                name: name || `channel-${match[2]}`,
             });
-            
-            return guilds;
         }
-    """)
-
-    # Convert JavaScript results to DiscordGuild objects
-    guilds = [
-        DiscordGuild(id=guild_data["id"], name=guild_data["name"], icon=None)
-        for guild_data in guilds_data
-    ]
-
-    return state, guilds
+        return [...channels.values()];
+    }
+"""
 
 
 async def get_guild_channels(
     state: ClientState, guild_id: str
 ) -> tuple[ClientState, list[DiscordChannel]]:
     state = await _login(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
+    page = _require_page(state)
 
-    await state.page.goto(
+    await page.goto(
         f"https://discord.com/channels/{guild_id}", wait_until="domcontentloaded"
     )
-    await state.page.wait_for_timeout(3000)
 
-    # Helper function to extract channels
-    def extract_channels_js() -> str:
-        return f"""
-            (() => {{
-                const channels = [];
-                const seenIds = new Set();
-                const links = document.querySelectorAll('a[href*="/channels/"]');
-                
-                links.forEach(link => {{
-                    const match = link.href.match(/\\/channels\\/{guild_id}\\/([0-9]+)/);
-                    if (match) {{
-                        const channelId = match[1];
-                        if (!seenIds.has(channelId)) {{
-                            seenIds.add(channelId);
-                            let name = link.textContent?.trim() || '';
-                            name = name.replace(/^[^a-zA-Z0-9#-_]+/, '').trim();
-                            name = name.replace(/\\s+/g, ' ').trim();
-                            channels.push({{
-                                id: channelId,
-                                name: name || `channel-${{channelId}}`,
-                                href: link.href
-                            }});
-                        }}
-                    }}
-                }});
-                return channels;
-            }})()
-        """
+    # A guild you are in shows you at least one channel, so the same rule holds
+    # here as for the rail: no row means the sidebar never rendered.
+    rows = await _extract_rows(
+        page, _EXTRACT_CHANNELS_JS, guild_id, what=f"guild {guild_id}'s channel list"
+    )
+    logger.debug(f"Found {len(rows)} channels in guild {guild_id}")
 
-    # Step 1: Get original channels
-    logger.debug("Getting original channels")
-    original_channels = await state.page.evaluate(extract_channels_js())
-    logger.debug(f"Found {len(original_channels)} original channels")
-
-    # Step 2: Click Browse Channels and get additional channels
-    browse_channels = []
-    try:
-        browse_element = await state.page.query_selector(
-            '*:has-text("Browse Channels")'
-        )
-        if browse_element and await browse_element.is_visible():
-            await browse_element.click()
-            await state.page.wait_for_timeout(5000)
-            logger.debug("Clicked Browse Channels")
-
-            # Scroll all scrollable elements to load hidden channels
-            await state.page.evaluate("""
-                Array.from(document.querySelectorAll('*'))
-                    .filter(el => el.scrollHeight > el.clientHeight + 5)
-                    .forEach(el => el.scrollTop = el.scrollHeight)
-            """)
-            await state.page.wait_for_timeout(3000)
-
-            browse_channels = await state.page.evaluate(extract_channels_js())
-            logger.debug(f"Found {len(browse_channels)} browse channels")
-    except Exception as e:
-        logger.debug(f"Browse Channels failed: {e}")
-
-    # Step 3: Combine channels (original first, then new browse channels)
-    all_channels = {}
-    final_channels = []
-
-    # Add original channels first
-    for ch in original_channels:
-        all_channels[ch["id"]] = ch
-        final_channels.append(ch)
-
-    # Add new browse channels
-    for ch in browse_channels:
-        if ch["id"] not in all_channels:
-            final_channels.append(ch)
-
-    logger.debug(f"Total unique channels: {len(final_channels)}")
-
-    channels = [
-        DiscordChannel(id=ch["id"], name=ch["name"], type=0, guild_id=guild_id)
-        for ch in final_channels
-    ]
-
-    return state, channels
+    return state, [DiscordChannel(id=ch["id"], name=ch["name"]) for ch in rows]
 
 
 async def _extract_message_data(

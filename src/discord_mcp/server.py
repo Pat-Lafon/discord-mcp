@@ -91,7 +91,7 @@ async def get_channels(server_id: str) -> list[dict[str, str]]:
         return await get_guild_channels(state, server_id)
 
     channels = await _execute_with_persistent_client(discord_ctx, operation)
-    return [{"id": c.id, "name": c.name, "type": str(c.type)} for c in channels]
+    return [{"id": c.id, "name": c.name} for c in channels]
 
 
 @mcp.tool()
