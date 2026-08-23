@@ -1,7 +1,7 @@
 [project]
 name = "discord-mcp"
 version = "0.2.0"
-description = "Discord MCP server for reading and sending Discord messages"
+description = "Discord MCP server for reading Discord messages"
 readme = "README.md"
 authors = [
     { name = "elyx", email = "elio@pascarelli.com" }

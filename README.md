@@ -1,12 +1,11 @@
 # Discord MCP Server
 
-A Model Context Protocol (MCP) server that lets LLMs read messages, discover channels, send messages, and monitor Discord communities using web scraping.
+A Model Context Protocol (MCP) server that lets LLMs read messages, discover channels, and monitor Discord communities using web scraping. Read-only: it exposes no tool that writes to Discord.
 
 ## Features
 
 - List Discord servers and channels you have access to
 - Read recent messages with time filtering (newest first)
-- Send messages to Discord channels (automatically splits long messages)
 - Web scraping approach - works with any Discord server you can access as a user
 - No bot permissions or API tokens required
 

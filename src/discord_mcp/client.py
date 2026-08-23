@@ -489,27 +489,3 @@ async def get_channel_messages(
         await state.page.wait_for_timeout(1000)
 
     return state, sorted(messages, key=lambda m: m.timestamp, reverse=True)[:limit]
-
-
-async def send_message(
-    state: ClientState, server_id: str, channel_id: str, content: str
-) -> tuple[ClientState, str]:
-    state = await _login(state)
-    if not state.page:
-        raise RuntimeError("Browser page not initialized")
-
-    await state.page.goto(
-        f"https://discord.com/channels/{server_id}/{channel_id}",
-        wait_until="domcontentloaded",
-    )
-    await state.page.wait_for_selector('[data-slate-editor="true"]', timeout=10000)
-
-    message_input = await state.page.query_selector('[data-slate-editor="true"]')
-    if not message_input:
-        raise RuntimeError("Could not find message input")
-
-    await message_input.fill(content)
-    await state.page.keyboard.press("Enter")
-    await asyncio.sleep(1)
-
-    return state, f"sent-{int(datetime.now().timestamp())}"
