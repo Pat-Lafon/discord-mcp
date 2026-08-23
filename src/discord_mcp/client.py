@@ -716,3 +716,74 @@ async def get_channel_messages(
         messages=sorted(messages, key=lambda m: m.timestamp, reverse=True),
         stop=stop,
     )
+
+
+# Discord renders a channel's active threads in the left sidebar grouped in a
+# ul[role="group"] labeled "{channelName} threads" — that IS Discord's thread
+# index, so we read it (selectors below) instead of inferring threads from
+# creation markers in the message feed. We match the group by that label rather
+# than walking up from the channel row, because the row's nearest <li> excludes
+# the group; the label scopes to this channel even with several expanded.
+#
+# A row's label reads "{name} ({type})" with any state appended after it, comma
+# separated — "the-furious-five (text channel), Private Channel (locked)",
+# "Philbertia-Voice (voice channel), unread" (measured 2026-08-15 over 27 rows).
+# So a name is everything before the first " (", and membership in the group is
+# what makes a row a thread: a label suffix would stop matching the moment the
+# thread had unread messages, which is the only time its rows are worth reading.
+_THREAD_SCRAPE_JS = r"""
+    (channelId) => {
+        const parent = document.querySelector(
+            `[data-list-item-id="channels___${channelId}"]`);
+        const name = (parent.getAttribute('aria-label') || '').split(' (')[0];
+        const grp = document.querySelector(
+            `ul[role="group"][aria-label="${name} threads"]`);
+        if (!grp) return [];  // no group -> channel has no active threads
+        const out = [];
+        for (const el of grp.querySelectorAll('[data-list-item-id^="channels___"]')) {
+            out.push({
+                id: el.getAttribute('data-list-item-id').replace('channels___', ''),
+                name: (el.getAttribute('aria-label') || '').split(' (')[0].trim(),
+            });
+        }
+        return out;
+    }
+"""
+
+
+async def get_channel_threads(
+    state: ClientState, server_id: str, channel_id: str
+) -> tuple[ClientState, list[DiscordChannel]]:
+    """Discover a channel's active threads from Discord's own sidebar thread
+    index (see `_THREAD_SCRAPE_JS`), read after navigating to the channel so it
+    is the selected one whose thread group is rendered. A thread is found
+    regardless of when it was created.
+
+    Boundary: the sidebar lists *active* (non-archived) threads only. A thread
+    that had activity in the review window but has since auto-archived won't
+    appear — reading archived threads means driving the header Threads popout's
+    search/scroll, which exposes no stable thread ids. A thread is read like any
+    channel via its id."""
+    state, page = await _open_channel(state, server_id, channel_id)
+    # We just navigated here, so this channel's own sidebar row must render. If it
+    # never does, the page is broken (failed load or Discord DOM change) — fail
+    # loud rather than report the channel as thread-free and silently drop every
+    # thread under it. Not `_extract_rows`, which reads an empty result as that
+    # failure: here a channel with no active thread is a true answer, so what has
+    # to render is the row rather than a row of output.
+    try:
+        await page.wait_for_selector(
+            f'[data-list-item-id="channels___{channel_id}"]', timeout=15000
+        )
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(
+            f"channel {channel_id} sidebar row never rendered; thread scrape is"
+            " broken (failed load or Discord DOM change)"
+        ) from e
+
+    threads = [
+        DiscordChannel(id=row["id"], name=row["name"] or f"thread-{row['id']}")
+        for row in await page.evaluate(_THREAD_SCRAPE_JS, channel_id)
+    ]
+    logger.debug(f"Discovered {len(threads)} thread(s) under channel {channel_id}")
+    return state, threads
