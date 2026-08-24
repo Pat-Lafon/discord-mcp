@@ -1,3 +1,38 @@
+"""Playwright client for Discord's web app — paging, row extraction, session.
+
+Everything here reads a rendered DOM Discord is free to change, so each rule
+below is what a selector break looks like from the outside.
+
+Paging keys extractions by message id and overwrites: each pass re-extracts
+every rendered row, every field belongs to the row itself, and whichever pass
+last rendered it read the whole story. An edit, or a component that mounted
+late, is therefore not masked by the first thing the row was ever seen to say.
+No field merges across passes.
+
+A row's author is read from the row, not inferred from the name above it.
+Discord writes a username node only on the first row of a run, but every
+continuation labels itself with that node's id — the `message-username-*`
+entry in its `aria-labelledby`. That holds across virtualization, which evicts
+whole groups and never renders a continuation without its head. A reply row
+labels its article with the message it quotes, so the extractor matches the
+`message-username-` prefix rather than taking the first idref.
+
+A row names someone and says something, or it is not a row this extractor
+understands. A row that reads as authorless, or as having no text, attachment,
+poll or link, is a selector that stopped matching, so it returns null and is
+counted rather than reported under a placeholder. The extractor tolerates *one*
+null — a pass with more than that and more than a tenth raises, because a
+half-broken extractor returns a short read and short is the shape of an
+ordinary quiet day here.
+
+The opening banner is the one row that is no message — a thread's starter, or a
+channel's "Welcome to #name!" — and Discord gives it the feed's own id, so the
+extractor drops the row whose trailing id segment equals the channel id it was
+passed. That id dates the banner to the feed's creation, which would end paging
+on the spot. It is also what `FEED_EXHAUSTED` is read from, by id rather than
+class, since class names are content-hashed and churn.
+"""
+
 import asyncio
 import enum
 import pathlib as pl
