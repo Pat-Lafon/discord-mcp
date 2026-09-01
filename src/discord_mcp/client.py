@@ -454,6 +454,12 @@ _EXTRACT_ROWS_JS = """
     for (const img of clone.querySelectorAll('img[alt]')) {
       img.replaceWith(img.getAttribute('alt'));
     }
+    // textContent joins descendants with nothing between them, which reads a
+    // list as one word ("Poison resistanceFrost Giant strengthGreater
+    // healing"). Discord's own newlines survive it; a list's item boundaries
+    // and a <br> do not, and the DM's loot and notes posts are lists.
+    for (const br of clone.querySelectorAll('br')) br.replaceWith('\\n');
+    for (const li of clone.querySelectorAll('li')) li.prepend('\\n');
     return clone.textContent.trim();
   };
   // First own match holding text. Scanning past the empty ones is what reads a
