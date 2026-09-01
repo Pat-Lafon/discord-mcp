@@ -63,7 +63,17 @@ async lock serializes tool calls against the shared state. Cookies persist at
 
 `_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare
 30s default aborted daily runs mid-feed on a cold navigation, and the retry that existed covered only
-`wait_for_selector` — the step that does not fail.
+`wait_for_selector`, which a text channel's feed satisfies on navigation alone.
+
+A voice channel is the one feed that does not: it opens on its voice UI and keeps its text chat behind
+the header's `Show Chat` button. Which kind of feed this is decides whether there is anything to wait for
+yet, so `_open_channel` reads the kind off the sidebar row rather than inferring it from what did or did
+not render — `aria-label` there ends in `(text channel)`, `(voice channel)` or `(thread)`. Navigating to
+a feed scrolls its row into view, which is what makes the row readable despite the sidebar virtualizing.
+Scope the toggle to `button`: the sidebar hangs the same `aria-label` on a zero-size `div[role="button"]`
+per voice channel, and clicking one of those opens a different channel. Past the click every reader works
+unchanged — a voice channel's chat pages, extracts and dates exactly like a text channel's, and carries
+no threads.
 
 ## Login (cookie-only, always)
 

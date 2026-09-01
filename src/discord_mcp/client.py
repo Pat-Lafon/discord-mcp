@@ -304,7 +304,7 @@ async def _extract_rows(
     """
     try:
         await page.wait_for_function(
-            f"(a) => ({js})(a).length > 0", arg, timeout=timeout_ms
+            f"(a) => ({js})(a).length > 0", arg=arg, timeout=timeout_ms
         )
     except PlaywrightTimeoutError as e:
         raise RuntimeError(
@@ -603,11 +603,27 @@ def _message(raw: dict, channel_id: str) -> DiscordMessage:
     )
 
 
+# The chat toggle in a voice channel's header. Scoped to `button` because the
+# sidebar carries the same label on a zero-size `div[role="button"]` for every
+# voice channel in the guild — eight of them alongside one real toggle, measured
+# 2026-09-01 — and clicking one of those opens a different channel's chat.
+_CHAT_TOGGLE = 'button[aria-label="Show Chat"], button[aria-label="Open Chat"]'
+
+# The sidebar row for a feed, which names its kind: `the-furious-five (text
+# channel)`, `insatiable-heroes (voice channel)`, `Trolley Problem (thread)`.
+# Navigating to a feed scrolls its row into view, so the row is there to read
+# even though the sidebar virtualizes.
+_SIDEBAR_ROW = '[data-list-item-id$="___{channel_id}"]'
+_VOICE_KIND = "(voice channel)"
+
+
 async def _open_channel(
     state: ClientState, server_id: str, channel_id: str
 ) -> tuple[ClientState, Page]:
     """Navigate to a channel (or thread — a thread is addressed like a channel)
-    and wait for its message list. Both steps are flaky, so both get the same
+    and wait for its message list, reading the feed's kind off its sidebar row
+    first and revealing the chat on a voice channel, which hides it behind the
+    voice UI. Both steps are flaky, so both get the same
     generous bound and one retry: the chat list usually appears in ~2s but
     sometimes stalls indefinitely, and the navigation itself is what timed out on
     3 of the 22 daily runs to 2026-08-16 — the bare 30s default against a 16s
@@ -619,6 +635,15 @@ async def _open_channel(
 
     async def open_once() -> None:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        # Which kind of feed this is decides whether there is a feed to wait for
+        # yet: a text channel and a thread render theirs on navigation, while a
+        # voice channel opens on its voice UI and keeps the chat behind the
+        # header toggle. The sidebar row says the kind outright, so the wait is
+        # never spent discovering it.
+        row = page.locator(_SIDEBAR_ROW.format(channel_id=channel_id))
+        await row.wait_for(timeout=60000)
+        if _VOICE_KIND in (await row.get_attribute("aria-label") or ""):
+            await page.click(_CHAT_TOGGLE)
         await page.wait_for_selector('[data-list-id="chat-messages"]', timeout=60000)
 
     try:
