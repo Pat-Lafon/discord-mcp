@@ -10,49 +10,15 @@ The daily review captures that logger's stderr stream as its trace file, the onl
 counts and paging timings. stdout is reserved — the MCP stdio channel here, the transcript channel in
 `../bin/discord_messages.py`.
 
-`get_channel_messages` pages by jumping the feed's scroller to 0 each pass, the one gesture that
-triggers Discord's older-history load (~20 rows per chunk); a keyboard PageUp moves one viewport within
-already-rendered rows and loads nothing. The loop is bounded by progress rather than a pass count and
-returns which of three exits it took as a `StopReason`: `WINDOW_EDGE` (a row older than `since`
-rendered), `FEED_EXHAUSTED` (the feed's opening banner rendered), or `STALLED` (three passes surfacing
-no new row). `covers_window` is the first two, and is what a watermark caller checks before advancing
-past the window. `since` is the read's only bound and every row inside the window comes back — a row
-cap would buy wall-clock by cutting the rows nearest `since`, exactly the ones a watermark caller never
-revisits, while reporting the window covered. The pass that reaches the edge overshoots it, so
-`get_channel_messages` drops what it rendered past `since` before returning.
+A thread's messages never appear in the parent channel's feed, which shows only a "started a thread"
+marker, so `../bin/discord_messages.py` calls `get_channel_threads` per configured channel and reads
+each thread as its own feed — a channel carrying its traffic in per-arc threads reads as empty
+otherwise.
 
-Both clean exits are read off a rendered row, so `STALLED` means only that Discord served no more
-history and no beginning came into view. **Don't decide exhaustion by geometry** — nothing scrollable
-under the list — because a loaded feed taller than its pane scrolls exactly like a stalled one, so a
-feed read end to end reports as a stall. Geometry stays as a fast path for a feed shorter than its
-pane; the banner decides. Nothing scrollable under a list that exists is `FEED_EXHAUSTED`, not a stall,
-while no message list at all raises — `_open_channel` already waited for one, so that is a feed that
-vanished mid-page.
-
-A message's post time comes from its id, not from the row: Discord ids are snowflakes carrying
-milliseconds since 2015-01-01 in their high 42 bits. A row cannot render without its id, so there is no
-timestamp-less row to date to now and no fallback to guess. `_posted_at` raises on a decode that is no
-post time — an id with no timestamp bits set (it decodes to the epoch instant, reads as older than any
-window, and would end paging on the spot) or a result outside Discord's lifetime (the shift or epoch
-constant is wrong). Both otherwise produce a plausible-looking date, and that date is the window
-boundary.
-
-`get_guilds` and `get_guild_channels` both read through `_extract_rows`, which waits on the extractor's
-own output rather than on a container's selector — Discord renders a list's chrome ahead of what goes
-in it — and treats an empty result as breakage rather than an answer: you are in at least one guild,
-and a guild you are in shows you at least one channel, so zero would read as true and be believed.
-`get_channel_threads` is the one reader that stays out of it, waiting on the channel's own sidebar row,
-because there a zero *is* the answer.
-
-`get_channel_threads` reads the sidebar's thread group for the channel just navigated to and returns
-each thread as a `DiscordChannel` — a thread's id addresses it exactly like a channel, so
-`get_channel_messages` reads one unchanged. A thread's messages never appear in the parent channel's
-feed, which shows only a "started a thread" marker, so `../bin/discord_messages.py` calls it per
-configured channel and reads each thread as its own feed — a channel carrying its traffic in per-arc
-threads reads as empty otherwise. The sidebar lists active threads only.
-
-Row extraction — how a row's author, validity, and the opening banner are read off a DOM Discord is
-free to change — is `client.py`'s module docstring. Read it before touching a selector.
+Paging and its three stop reasons, snowflake dating, why an empty extraction is a failure rather than
+an answer, the voice-channel chat toggle, and row extraction — how a row's author, validity, and the
+opening banner are read off a DOM Discord is free to change — are in `src/discord_mcp/client.py`'s
+module and function docstrings. Read them before touching a selector.
 
 ## Reliability
 
@@ -60,20 +26,6 @@ One browser is reused across MCP tool calls (`_execute_with_persistent_client`),
 page closes or an attempt fails; a Playwright or `TransientLoginError` failure is retried once, and an
 async lock serializes tool calls against the shared state. Cookies persist at
 `~/.discord_mcp_cookies.json`.
-
-`_open_channel` bounds its `goto` at 60s and retries the whole open once, navigation included. The bare
-30s default aborted daily runs mid-feed on a cold navigation, and the retry that existed covered only
-`wait_for_selector`, which a text channel's feed satisfies on navigation alone.
-
-A voice channel is the one feed that does not: it opens on its voice UI and keeps its text chat behind
-the header's `Show Chat` button. Which kind of feed this is decides whether there is anything to wait for
-yet, so `_open_channel` reads the kind off the sidebar row rather than inferring it from what did or did
-not render — `aria-label` there ends in `(text channel)`, `(voice channel)` or `(thread)`. Navigating to
-a feed scrolls its row into view, which is what makes the row readable despite the sidebar virtualizing.
-Scope the toggle to `button`: the sidebar hangs the same `aria-label` on a zero-size `div[role="button"]`
-per voice channel, and clicking one of those opens a different channel. Past the click every reader works
-unchanged — a voice channel's chat pages, extracts and dates exactly like a text channel's, and carries
-no threads.
 
 ## Login (cookie-only, always)
 
