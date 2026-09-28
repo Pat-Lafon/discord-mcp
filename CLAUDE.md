@@ -10,11 +10,6 @@ The daily review captures that logger's stderr stream as its trace file, the onl
 counts and paging timings. stdout is reserved — the MCP stdio channel here, the transcript channel in
 `../bin/discord_messages.py`.
 
-A thread's messages never appear in the parent channel's feed, which shows only a "started a thread"
-marker, so `../bin/discord_messages.py` calls `get_channel_threads` per configured channel and reads
-each thread as its own feed — a channel carrying its traffic in per-arc threads reads as empty
-otherwise.
-
 Paging and its three stop reasons, snowflake dating, why an empty extraction is a failure rather than
 an answer, the voice-channel chat toggle, and row extraction — how a row's author, validity, and the
 opening banner are read off a DOM Discord is free to change — are in `src/discord_mcp/client.py`'s
