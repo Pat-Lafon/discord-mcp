@@ -45,10 +45,9 @@ as the one sign-in step. The invariants an edit must not break:
 
 ## Development workflow
 
-Run what `.github/workflows/pr-checks.yml` gates a PR on, in its order: `uv run pyright`,
-`uv run ruff check .`, `uv run ruff format --check .`. `uv run` takes ruff from this project's pinned
-dev group; `uvx ruff` resolves its own version and can disagree with CI. There is no test suite, so
-verify an affected MCP tool by driving the client path directly against live Discord.
+Run `.github/workflows/pr-checks.yml`'s checks locally before opening a PR; use `uv run` (not
+`uvx ruff`) to stay on the pinned dev-group version CI uses. No test suite: verify an affected MCP
+tool by driving the client path directly against live Discord.
 
 ## Configuration
 
